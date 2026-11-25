@@ -714,6 +714,16 @@ public actor AskIndexStore {
 
     // MARK: - Semantic Span Storage
 
+    /// Which part of a book's `embed_span` table a single embedding burst targets.
+    public enum EmbeddingScope: Sendable, Equatable {
+        /// Tier 1 catch-up: spans in chapters up to and including `spineIndex`.
+        case upToSpine(Int)
+        /// Tier 2 quiet look-ahead: unread chapters strictly after `spineIndex`.
+        case afterSpine(Int)
+        /// All pending spans in book order.
+        case all
+    }
+
     /// Creates the optional `embed_span` sidecar table lazily rather than inside
     /// `migrator` (`v1`/`v2`) so upgrading the app does not bump
     /// `IndexKey.currentSchemaVersion` and force every reader to re-parse all
@@ -739,11 +749,32 @@ public actor AskIndexStore {
             CREATE INDEX IF NOT EXISTS embed_span_pos
             ON embed_span(model, spineIndex, startOffset)
             """)
+        try db.execute(sql: """
+            CREATE INDEX IF NOT EXISTS embed_span_pending
+            ON embed_span(model, spineIndex, spanOrdinal)
+            WHERE vec IS NULL
+            """)
     }
 
     /// Groups existing ~85-word `passage` rows into non-overlapping ~175–250 word
     /// `embed_span` pointers (idempotent; `vec` remains NULL until embedded).
+    /// Checks with a cheap read first so already-populated books do not open a
+    /// SQLite write transaction on every batch.
     private static func populateEmbedSpans(modelID: String, in queue: DatabaseQueue) throws {
+        let alreadyReady: Bool = try queue.read { db in
+            guard try db.tableExists("embed_span") else { return false }
+            let hasPendingIndex = try Int.fetchOne(
+                db,
+                sql: "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'embed_span_pending'",
+            ) != nil
+            guard hasPendingIndex else { return false }
+            let existing = try Int.fetchOne(
+                db, sql: "SELECT 1 FROM embed_span WHERE model = ? LIMIT 1", arguments: [modelID],
+            )
+            return existing != nil
+        }
+        if alreadyReady { return }
+
         try queue.write { db in
             try ensureEmbedSpanTable(in: db)
             let existing = try Int.fetchOne(
@@ -827,12 +858,13 @@ public actor AskIndexStore {
     }
 
     private static func nextPendingSpans(
-        modelID: String, upToSpine: Int?, limit: Int, in queue: DatabaseQueue,
+        modelID: String, scope: EmbeddingScope, limit: Int, in queue: DatabaseQueue,
     ) throws -> [PendingSpan] {
         try queue.read { db in
             guard try db.tableExists("embed_span") else { return [] }
             let rows: [Row]
-            if let upToSpine {
+            switch scope {
+            case let .upToSpine(upToSpine):
                 rows = try Row.fetchAll(db, sql: """
                     SELECT id, spineIndex, startOrdinal, endOrdinal
                     FROM embed_span
@@ -840,7 +872,15 @@ public actor AskIndexStore {
                     ORDER BY spineIndex, spanOrdinal
                     LIMIT ?
                     """, arguments: [modelID, upToSpine, limit])
-            } else {
+            case let .afterSpine(afterSpine):
+                rows = try Row.fetchAll(db, sql: """
+                    SELECT id, spineIndex, startOrdinal, endOrdinal
+                    FROM embed_span
+                    WHERE model = ? AND vec IS NULL AND spineIndex > ?
+                    ORDER BY spineIndex, spanOrdinal
+                    LIMIT ?
+                    """, arguments: [modelID, afterSpine, limit])
+            case .all:
                 rows = try Row.fetchAll(db, sql: """
                     SELECT id, spineIndex, startOrdinal, endOrdinal
                     FROM embed_span
@@ -922,9 +962,69 @@ public actor AskIndexStore {
         }
     }
 
-    /// Crash-safe, deduplicated, resumable embedding builder. Commits each
-    /// batch atomically and invalidates `spanVectorCache` immediately on write
-    /// so cancellation never leaves stale cached vectors behind.
+    private static func isValidSpanVector(_ vector: [Float]) -> Bool {
+        guard !vector.isEmpty else { return false }
+        var sumSq: Float = 0
+        for value in vector {
+            guard value.isFinite else { return false }
+            sumSq += value * value
+        }
+        return sumSq > 1e-6
+    }
+
+    /// Embeds at most one micro-batch (`maxSpans`) for `scope` and releases the
+    /// per-book `embeddingInFlight` lock immediately afterward, so scheduler
+    /// cooldown sleeps never block live Ask catch-up. Verifies file identity
+    /// across the `await embedder.embed(...)` suspension so an index rebuild
+    /// mid-batch can never write vectors to mismatched row IDs.
+    @discardableResult
+    public func embedNextBatch(
+        in bookUUID: String,
+        embedder: any EmbeddingModel,
+        scope: EmbeddingScope = .all,
+        maxSpans: Int = SemanticRetriever.Limits.indexingBatchSize,
+    ) async throws -> Int {
+        while embeddingInFlight[bookUUID] != nil {
+            try await waitForEmbedding(of: bookUUID)
+        }
+        embeddingInFlight[bookUUID] = [:]
+        defer { finishEmbedding(of: bookUUID) }
+
+        try Task.checkCancellation()
+        guard let activeQueue = try queue(for: bookUUID),
+              let expectedIdentity = open[bookUUID]?.identity
+        else { return 0 }
+
+        try Self.populateEmbedSpans(modelID: embedder.modelID, in: activeQueue)
+        let batch = try Self.nextPendingSpans(
+            modelID: embedder.modelID, scope: scope, limit: max(1, maxSpans), in: activeQueue,
+        )
+        if batch.isEmpty { return 0 }
+
+        // Inference suspends off-lock; save completed vectors before propagating
+        // cancellation so finished Neural Engine work is never thrown away.
+        let vectors = try await embedder.embed(batch.map(\.text), mode: .document)
+        guard vectors.count == batch.count else { return 0 }
+
+        let validPairs: [(Int64, [Float])] = zip(batch, vectors).compactMap { span, vector in
+            Self.isValidSpanVector(vector) ? (span.id, vector) : nil
+        }
+        guard !validPairs.isEmpty else { return 0 }
+
+        // Re-check file identity so a concurrent index rebuild (new inode) never
+        // receives vectors computed against the replaced database's row IDs.
+        if let writeQueue = try queue(for: bookUUID),
+           open[bookUUID]?.identity == expectedIdentity {
+            try Self.saveSpanVectors(validPairs, in: writeQueue)
+            removeSpanCacheEntry(SpanCacheKey(bookUUID: bookUUID, modelID: embedder.modelID))
+            return validPairs.count
+        }
+        return 0
+    }
+
+    /// Crash-safe, deduplicated, resumable embedding builder. Loops over
+    /// `embedNextBatch` until `upToSpine` is embedded, `shouldContinue` returns
+    /// false, or the task is cancelled.
     @discardableResult
     public func ensureEmbeddings(
         in bookUUID: String,
@@ -933,44 +1033,19 @@ public actor AskIndexStore {
         batchSize: Int = SemanticRetriever.Limits.indexingBatchSize,
         shouldContinue: (@Sendable () -> Bool)? = nil,
     ) async throws -> Int {
-        // One embedding loop per book at a time, mirroring `prepare`: if a
-        // background task is mid-batch when a live question catches up inline,
-        // wait for that batch to land rather than embedding the same rows twice.
-        while embeddingInFlight[bookUUID] != nil {
-            try await waitForEmbedding(of: bookUUID)
-        }
-        embeddingInFlight[bookUUID] = [:]
-        defer { finishEmbedding(of: bookUUID) }
-
-        guard let initialQueue = try queue(for: bookUUID) else { return 0 }
-        try Self.populateEmbedSpans(modelID: embedder.modelID, in: initialQueue)
-
+        let scope: EmbeddingScope = upToSpine.map(EmbeddingScope.upToSpine) ?? .all
         var totalWritten = 0
-        let clampedBatch = max(1, batchSize)
-        let cacheKey = SpanCacheKey(bookUUID: bookUUID, modelID: embedder.modelID)
-
         while true {
             try Task.checkCancellation()
             if let shouldContinue, !shouldContinue() { break }
-            guard let activeQueue = try queue(for: bookUUID) else { break }
-            // If the index file was rebuilt while suspended, repopulate spans cleanly.
-            try Self.populateEmbedSpans(modelID: embedder.modelID, in: activeQueue)
-            let batch = try Self.nextPendingSpans(
-                modelID: embedder.modelID, upToSpine: upToSpine, limit: clampedBatch, in: activeQueue,
+            let written = try await embedNextBatch(
+                in: bookUUID,
+                embedder: embedder,
+                scope: scope,
+                maxSpans: batchSize,
             )
-            if batch.isEmpty { break }
-
-            // Inference suspends off-lock; save completed vectors before throwing
-            // cancellation so finished Neural Engine work is never thrown away.
-            let vectors = try await embedder.embed(batch.map(\.text), mode: .document)
-            guard vectors.count == batch.count else { break }
-
-            if let writeQueue = try queue(for: bookUUID) {
-                let pairs = zip(batch, vectors).map { ($0.0.id, $0.1) }
-                try Self.saveSpanVectors(pairs, in: writeQueue)
-                removeSpanCacheEntry(cacheKey)
-                totalWritten += pairs.count
-            }
+            if written == 0 { break }
+            totalWritten += written
             try Task.checkCancellation()
         }
         return totalWritten

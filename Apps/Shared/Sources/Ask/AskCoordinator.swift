@@ -109,15 +109,9 @@ final class AskCoordinator {
     private(set) var indexingBooks: Set<String> = []
     private var embeddingDownloadTask: Task<Void, Never>?
     private var embeddingDownloadToken: UUID?
-    private var embeddingPrewarmTask: (token: UUID, task: Task<Void, Never>)?
     private var pendingModelRemoval: Task<Void, Never>?
-    /// Per-book background embedding tasks, paired with an identity token so a
-    /// cancelled pass can never clear the handle of a newer chapter's pass.
-    private var embeddingTasks: [String: (token: UUID, task: Task<Void, Never>)] = [:]
-    /// Last active book open in a reader, so indexing resumes automatically
-    /// once thermal pressure or Low Power Mode clears.
-    private var lastIndexedBook: (source: BookSource, upToSpine: Int)?
-    private var isAppActive = true
+    /// Single-loop, three-tier foreground scheduler for on-device book embeddings.
+    private var embeddingScheduler: EmbeddingScheduler!
 
     /// The observer token, in a box `deinit` can reach, keeping a weak reference
     /// to the centre it registered on so injected test centres never leak.
@@ -205,6 +199,15 @@ final class AskCoordinator {
             self.embeddingModelState = .notInstalled
         }
         preparer = AskEngine(model: self.model, store: store, turnstile: turnstile)
+        embeddingScheduler = EmbeddingScheduler(
+            store: store,
+            preparer: preparer,
+            defaults: defaults,
+            coreMLEmbedder: coreMLEmbedder,
+            activeEmbedder: { [weak self] in self?.activeEmbedder },
+            onIndexingBooksChanged: { [weak self] books in self?.indexingBooks = books },
+            centre: centre,
+        )
 
         // The indexes are per book and the books are per account, so an account
         // leaving takes its indexes with it. Through the same notification
@@ -385,10 +388,9 @@ final class AskCoordinator {
     }
 
     func prepare(source: BookSource) {
-        // Re-warm the CoreML embedding runtime whenever the Ask sheet opens
-        // (even on a book whose SQLite index is already `prepared`), because
-        // `appDidEnterBackground()` unloads CoreML buckets to keep RAM low.
-        prewarmEmbeddingModel(priority: .userInitiated)
+        // Prewarm `embed_512` and boost Tier 1 catch-up while the reader is in
+        // the Ask sheet (even when this book's SQLite index is already prepared).
+        embeddingScheduler.askSheetOpened(bookUUID: source.bookUUID)
         let uuid = source.bookUUID
         guard !prepared.contains(uuid), preparing[uuid] == nil else { return }
         // The device's model is warmed only where it can answer; a reader's
@@ -474,7 +476,7 @@ final class AskCoordinator {
                 self?.embeddingModelState = .ready
                 self?.embeddingDownloadTask = nil
                 self?.embeddingDownloadToken = nil
-                self?.resumeLastIndexedBookIfPossible()
+                self?.embeddingScheduler.modelBecameReady()
             } catch {
                 guard self?.embeddingDownloadToken == token else { return }
                 self?.embeddingDownloadTask = nil
@@ -502,8 +504,7 @@ final class AskCoordinator {
 
     func removeEmbeddingModel() {
         cancelEmbeddingModelDownload()
-        cancelEmbeddingPrewarm()
-        cancelAllBackgroundEmbeddings()
+        embeddingScheduler.modelRemoved()
         embeddingModelState = .notInstalled
         if let client = coreMLEmbedder {
             let previous = pendingModelRemoval
@@ -514,182 +515,56 @@ final class AskCoordinator {
         }
     }
 
-    /// Warms up the on-device CoreML embedding runtime (`embed_512`) so the
-    /// first live Ask query doesn't pay the cold CoreML load/compile delay.
-    private func prewarmEmbeddingModel(priority: TaskPriority) {
-        guard isAppActive,
-              embeddingModelState.isReady,
-              let client = coreMLEmbedder,
-              embeddingPrewarmTask == nil
-        else { return }
-        let token = UUID()
-        let task = Task(priority: priority) { [weak self] in
-            await client.prewarm()
-            await MainActor.run {
-                if self?.embeddingPrewarmTask?.token == token {
-                    self?.embeddingPrewarmTask = nil
-                }
-            }
-        }
-        embeddingPrewarmTask = (token: token, task: task)
-    }
-
-    private func cancelEmbeddingPrewarm() {
-        embeddingPrewarmTask?.task.cancel()
-        embeddingPrewarmTask = nil
-    }
-
     /// Called by `ReaderView` when its scene becomes active, avoiding a firing-
     /// order race against `IssaReaderApp.appDidBecomeActive()`.
     func readerDidBecomeActive(for model: ReaderModel) {
-        isAppActive = true
+        embeddingScheduler.appDidBecomeActive()
         indexEmbeddingsInBackground(for: model)
     }
 
-    /// Quietly indexes semantic spans up to the reader's current chapter on
-    /// book open and chapter turns. Stops cleanly on background, thermal
-    /// pressure, Low Power Mode, live question start, or reader close.
+    /// Quietly indexes semantic spans via the three-tier foreground scheduler
+    /// (full-speed catch-up up to `chapterIndex`, then cool look-ahead through
+    /// the rest of the book).
     func indexEmbeddingsInBackground(for model: ReaderModel) {
         guard model.phase == .ready, let source = model.askSource() else { return }
         indexEmbeddingsInBackground(source: source, upToSpine: model.chapterIndex)
     }
 
-    /// True while a background embedding pass is actively embedding unindexed
-    /// read spans for `bookUUID`.
+    /// True while Tier 1 catch-up is actively embedding unindexed read spans
+    /// for `bookUUID` (debounced so quick chapter turns never flash).
     func isIndexingEmbeddings(for bookUUID: String) -> Bool {
         indexingBooks.contains(bookUUID)
     }
 
     func indexEmbeddingsInBackground(source: BookSource, upToSpine: Int) {
-        lastIndexedBook = (source: source, upToSpine: upToSpine)
-        guard isAppActive,
-              let embedder = activeEmbedder,
-              !hasWorkingJob,
-              Self.canRunBackgroundEmbeddings()
-        else { return }
-
-        let uuid = source.bookUUID
-        embeddingTasks[uuid]?.task.cancel()
-        let token = UUID()
-        let existingPrep = preparing[uuid]
-        let task = Task(priority: .utility) { [weak self, preparer, store] in
-            await existingPrep?.value
-            guard !Task.isCancelled else { return }
-            do {
-                _ = try await preparer.prepareIndex(source: source)
-                guard !Task.isCancelled else { return }
-                let initial = try await store.embeddingProgress(
-                    in: uuid,
-                    modelID: embedder.modelID,
-                    upToSpine: upToSpine,
-                    ensureSpans: true,
-                )
-                guard initial.embedded < initial.total else {
-                    await MainActor.run {
-                        if self?.embeddingTasks[uuid]?.token == token {
-                            self?.indexingBooks.remove(uuid)
-                            self?.embeddingTasks.removeValue(forKey: uuid)
-                        }
-                        // Book is already 100% embedded on disk; quietly warm
-                        // `embed_512` while reading so the first Ask doesn't stall.
-                        self?.prewarmEmbeddingModel(priority: .utility)
-                    }
-                    return
-                }
-                await MainActor.run {
-                    if self?.embeddingTasks[uuid]?.token == token {
-                        self?.indexingBooks.insert(uuid)
-                    }
-                }
-                let clock = ContinuousClock()
-                let start = clock.now
-                let written = try await store.ensureEmbeddings(
-                    in: uuid,
-                    embedder: embedder,
-                    upToSpine: upToSpine,
-                    batchSize: SemanticRetriever.Limits.indexingBatchSize,
-                    shouldContinue: { Self.canRunBackgroundEmbeddings() },
-                )
-                if written > 0 {
-                    let elapsed = start.duration(to: clock.now)
-                    let seconds = Double(elapsed.components.seconds)
-                        + Double(elapsed.components.attoseconds) / 1e18
-                    let ms = Int((seconds * 1_000).rounded())
-                    let msPerSpan = Int(((seconds * 1_000) / Double(written)).rounded())
-                    let spansPerSec = seconds > 0 ? String(format: "%.1f", Double(written) / seconds) : "0"
-                    let readProgress = try? await store.embeddingProgress(
-                        in: uuid, modelID: embedder.modelID, upToSpine: upToSpine,
-                    )
-                    let bookProgress = try? await store.embeddingProgress(
-                        in: uuid, modelID: embedder.modelID,
-                    )
-                    var fields: [String: String] = [
-                        "book": uuid,
-                        "written": String(written),
-                        "ms": String(ms),
-                        "msPerSpan": String(msPerSpan),
-                        "spansPerSec": spansPerSec,
-                    ]
-                    if let readProgress {
-                        fields["embedded"] = String(readProgress.embedded)
-                        fields["upToTotal"] = String(readProgress.total)
-                    }
-                    if let bookProgress {
-                        fields["bookTotal"] = String(bookProgress.total)
-                    }
-                    IssaLog.info("ask background embeddings finished", fields)
-                }
-            } catch is CancellationError {
-                // Expected on chapter turn, backgrounding, or live ask.
-            } catch {
-                IssaLog.info("ask background embedding paused", [
-                    "kind": String(describing: type(of: error)),
-                ])
-            }
-            await MainActor.run {
-                if self?.embeddingTasks[uuid]?.token == token {
-                    self?.indexingBooks.remove(uuid)
-                    self?.embeddingTasks.removeValue(forKey: uuid)
-                }
-            }
-        }
-        embeddingTasks[uuid] = (token: token, task: task)
+        embeddingScheduler.activateBook(
+            source: source,
+            chapterIndex: upToSpine,
+            preparation: preparing[source.bookUUID],
+        )
     }
 
     func stopBackgroundEmbeddings(for bookUUID: String) {
-        embeddingTasks.removeValue(forKey: bookUUID)?.task.cancel()
-        indexingBooks.remove(bookUUID)
-        if lastIndexedBook?.source.bookUUID == bookUUID {
-            lastIndexedBook = nil
-        }
-    }
-
-    private func cancelAllBackgroundEmbeddings() {
-        for entry in embeddingTasks.values { entry.task.cancel() }
-        embeddingTasks.removeAll()
-        indexingBooks.removeAll()
+        embeddingScheduler.deactivateBook(bookUUID)
     }
 
     private func handleEnvironmentChange() {
-        if Self.canRunBackgroundEmbeddings() {
-            resumeLastIndexedBookIfPossible()
-        } else {
-            cancelAllBackgroundEmbeddings()
-        }
-    }
-
-    private func resumeLastIndexedBookIfPossible() {
-        guard isAppActive, let book = lastIndexedBook else { return }
-        indexEmbeddingsInBackground(source: book.source, upToSpine: book.upToSpine)
+        embeddingScheduler.handleEnvironmentChange()
     }
 
     private func handleMemoryWarning() {
-        cancelEmbeddingPrewarm()
-        cancelAllBackgroundEmbeddings()
-        if let client = coreMLEmbedder {
-            Task { await client.unloadModels() }
-        }
-        Task { [store] in await store.clearAllSpanCaches() }
+        embeddingScheduler.handleMemoryWarning(hasWorkingJob: hasWorkingJob)
+    }
+
+    private var hasWorkingOnDeviceEmbeddingJob: Bool {
+        jobs.values.contains { $0.state.isWorking && ($0.answeredBy == .device || $0.answeredBy == .cloud) }
+    }
+
+    private func syncEmbeddingAskState() {
+        embeddingScheduler.updateAskJobState(
+            onDeviceRunning: hasWorkingOnDeviceEmbeddingJob,
+            anyJobRunning: hasWorkingJob,
+        )
     }
 
     private static func isCancellation(_ error: any Error) -> Bool {
@@ -809,10 +684,9 @@ final class AskCoordinator {
         // `<uuid>.building.sqlite`.
         let preparation = preparing[uuid]
 
-        // Pause background embedding while a live question runs so the reader's
-        // query never waits behind a utility batch on the Neural Engine.
-        embeddingTasks.removeValue(forKey: uuid)?.task.cancel()
-        indexingBooks.remove(uuid)
+        // Pause background embedding only while an on-device or Apple-cloud Ask
+        // runs (OpenAI / Anthropic requests leave the Neural Engine idle).
+        syncEmbeddingAskState()
 
         // Per question, with the `searchBook` tool bound to this boundary: the
         // same factory `RegressionRun` asks the real model through. When the
@@ -924,6 +798,7 @@ final class AskCoordinator {
             guard answered else {
                 guard job.wasExpired else {
                     if jobs[uuid] === job { jobs.removeValue(forKey: uuid) }
+                    syncEmbeddingAskState()
                     releaseAssertionIfIdle()
                     return
                 }
@@ -933,6 +808,7 @@ final class AskCoordinator {
                 // back into `.working` — pulsing "Asking…" until the next
                 // launch, which is the exact thing that method exists to stop.
                 job.state = .failed(.backgroundExpired)
+                syncEmbeddingAskState()
                 releaseAssertionIfIdle()
                 return
             }
@@ -965,6 +841,7 @@ final class AskCoordinator {
     func cancel(bookUUID: String) {
         jobs[bookUUID]?.task?.cancel()
         jobs.removeValue(forKey: bookUUID)
+        syncEmbeddingAskState()
         releaseAssertionIfIdle()
     }
 
@@ -976,6 +853,7 @@ final class AskCoordinator {
 
     /// The sheet closed. A working job carries on.
     func sheetDismissed(bookUUID: String) {
+        embeddingScheduler.askSheetClosed(bookUUID: bookUUID)
         guard let job = jobs[bookUUID] else { return }
         guard job.state.isWorking else {
             // An answer nobody is looking at is not worth keeping: it exists
@@ -1019,6 +897,7 @@ final class AskCoordinator {
                 "answered": String(job.state.isAnswered),
             ])
         }
+        syncEmbeddingAskState()
         releaseAssertionIfIdle()
     }
 
@@ -1043,12 +922,7 @@ final class AskCoordinator {
     /// logging "ask job finished quietly". Leaving the app mid-question is
     /// exactly who the notification is for; the flag is set here too.
     func appDidEnterBackground() {
-        isAppActive = false
-        cancelEmbeddingPrewarm()
-        cancelAllBackgroundEmbeddings()
-        if let client = coreMLEmbedder, !hasWorkingJob {
-            Task { await client.unloadModels() }
-        }
+        embeddingScheduler.appDidEnterBackground(hasWorkingJob: hasWorkingJob)
         #if os(iOS)
         guard hasWorkingJob else { return }
         // Before the assertion guard, so a second backgrounding while one is
@@ -1077,9 +951,8 @@ final class AskCoordinator {
     }
 
     func appDidBecomeActive() {
-        isAppActive = true
         releaseAssertion()
-        resumeLastIndexedBookIfPossible()
+        embeddingScheduler.appDidBecomeActive()
     }
 
     #if os(iOS)
@@ -1103,6 +976,7 @@ final class AskCoordinator {
             job.task?.cancel()
             job.state = .failed(.backgroundExpired)
         }
+        syncEmbeddingAskState()
         releaseAssertion()
     }
     #endif
@@ -1143,11 +1017,7 @@ final class AskCoordinator {
         prepared = prepared.filter { kept.contains($0) }
         for (uuid, task) in preparing where !kept.contains(uuid) { task.cancel() }
         preparing = preparing.filter { kept.contains($0.key) }
-        for (uuid, entry) in embeddingTasks where !kept.contains(uuid) { entry.task.cancel() }
-        embeddingTasks = embeddingTasks.filter { kept.contains($0.key) }
-        if let book = lastIndexedBook, !kept.contains(book.source.bookUUID) {
-            lastIndexedBook = nil
-        }
+        embeddingScheduler.purgeBooks(keeping: kept)
         if let request = reopenRequest, !kept.contains(request) { reopenRequest = nil }
         // Only when nothing kept is still answering: the assertion is what lets
         // a question finish in the background.

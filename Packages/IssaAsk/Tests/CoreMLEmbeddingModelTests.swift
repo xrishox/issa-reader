@@ -85,10 +85,20 @@ struct CoreMLEmbeddingModelTests {
         defer { AskFixture.remove(dir) }
         let model = CoreMLEmbeddingModel(modelDirectory: dir)
         #expect(!model.isInstalledOnDisk())
-        await model.prewarm()
+        #expect(!(await model.isModelResident()))
+        #expect(!(await model.prewarm()))
         await #expect(throws: CoreMLEmbeddingModel.ModelError.modelNotInstalled) {
             _ = try await model.embed(["hello"], mode: .query)
         }
+    }
+
+    @Test("vector validation rejects empty, zero-norm, and non-finite vectors")
+    func vectorValidation() {
+        #expect(!CoreMLEmbeddingModel.isValidVector([]))
+        #expect(!CoreMLEmbeddingModel.isValidVector([0, 0, 0]))
+        #expect(!CoreMLEmbeddingModel.isValidVector([1, .nan, 0]))
+        #expect(!CoreMLEmbeddingModel.isValidVector([1, .infinity, 0]))
+        #expect(CoreMLEmbeddingModel.isValidVector([0.6, 0.8]))
     }
 
     @Test("downloadModel verifies SHA-256, installs atomically, sweeps stale staging, and rejects corruption")

@@ -390,4 +390,63 @@ struct SemanticRetrieverTests {
         #expect(AskProfile.cloud.withSemantic(.cloud).instructions == AskProfile.cloud.instructions)
         #expect(AskProfile.cloud.withSemantic(.cloud).usesSearchTool == AskProfile.cloud.usesSearchTool)
     }
+
+    @Test("embedNextBatch respects upToSpine and afterSpine scopes and rejects zero/NaN vectors")
+    func scopedBatchesAndVectorValidation() async throws {
+        let (store, source, directory) = try await AskFixture.preparedStore()
+        defer { AskFixture.remove(directory) }
+
+        let embedder = ScriptedEmbeddingModel()
+        let ch1 = AskFixture.Spine.chapterI
+        let readBefore = try await store.embeddingProgress(
+            in: source.bookUUID, modelID: embedder.modelID, upToSpine: ch1, ensureSpans: true,
+        )
+        let bookBefore = try await store.embeddingProgress(
+            in: source.bookUUID, modelID: embedder.modelID,
+        )
+        #expect(readBefore.total > 0)
+        #expect(bookBefore.total > readBefore.total)
+
+        // Tier 1 catch-up embeds only spans <= ch1 in bounded batches.
+        var caughtUp = 0
+        while true {
+            let n = try await store.embedNextBatch(
+                in: source.bookUUID, embedder: embedder, scope: .upToSpine(ch1), maxSpans: 2,
+            )
+            if n == 0 { break }
+            caughtUp += n
+        }
+        #expect(caughtUp == readBefore.total)
+        let afterTier1Read = try await store.embeddingProgress(
+            in: source.bookUUID, modelID: embedder.modelID, upToSpine: ch1,
+        )
+        let afterTier1Book = try await store.embeddingProgress(
+            in: source.bookUUID, modelID: embedder.modelID,
+        )
+        #expect(afterTier1Read.embedded == afterTier1Read.total)
+        #expect(afterTier1Book.embedded == afterTier1Read.total)
+
+        // Tier 2 look-ahead embeds spans strictly > ch1 without leaking past boundary.
+        let lookAheadWritten = try await store.embedNextBatch(
+            in: source.bookUUID, embedder: embedder, scope: .afterSpine(ch1), maxSpans: 3,
+        )
+        #expect(lookAheadWritten > 0)
+        let boundary = try AskFixture.endOf(spine: ch1)
+        let admitted = try await store.embeddedSpans(
+            in: source.bookUUID, modelID: embedder.modelID, before: boundary,
+        )
+        #expect(admitted.allSatisfy { $0.spineIndex <= ch1 })
+
+        // Zero / NaN vectors from a faulty embedder are never persisted.
+        struct BadVectorEmbedder: EmbeddingModel {
+            let modelID = "bad-vec-test"
+            func embed(_ texts: [String], mode _: EmbeddingMode) async throws -> [[Float]] {
+                texts.map { _ in [0, 0, .nan, 0] }
+            }
+        }
+        let badWritten = try await store.embedNextBatch(
+            in: source.bookUUID, embedder: BadVectorEmbedder(), scope: .all, maxSpans: 2,
+        )
+        #expect(badWritten == 0)
+    }
 }

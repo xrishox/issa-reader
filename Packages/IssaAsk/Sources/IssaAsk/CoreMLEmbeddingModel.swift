@@ -31,9 +31,10 @@ public enum EmbeddingModelState: Sendable, Equatable {
 /// - **Outside `StorageRoot/Ask`:** Lives under `StorageRoot/AskModels/` so
 ///   signing out of an account (which purges `Ask/`) never deletes the shared
 ///   313 MB model. Marked excluded from iCloud backup.
-/// - **Bounded iPhone RAM:** Memory-maps the 134 MB INT8 token table, caches at
-///   most two CoreML sequence-length functions (`maxLoadedBuckets = 2`) in LRU
-///   order, and locks `MLMultiArray` buffers via `withUnsafe[Mutable]Bytes` with
+/// - **Bounded iPhone RAM:** Memory-maps the 134 MB INT8 token table, caches a
+///   single resident `embed_512` CoreML function (`maxLoadedBuckets = 1`),
+///   loads the tokeniser and CoreML model off-actor via async `MLModel.load`,
+///   and locks `MLMultiArray` buffers via `withUnsafe[Mutable]Bytes` with
 ///   explicit `strides` so ANE `IOSurface` padding never misreads memory.
 public actor CoreMLEmbeddingModel: EmbeddingModel {
     public enum ModelError: Error, Sendable, Equatable {
@@ -174,6 +175,15 @@ public actor CoreMLEmbeddingModel: EmbeddingModel {
     private var loadedBuckets: [Int: SendableMLModel] = [:]
     private var bucketUseOrder: [Int] = []
 
+    // Single-flight async load tasks + invalidation generations so `unloadModels()`
+    // / `unloadAll()` never block behind a 20–63 s cold ANE compile and an
+    // obsolete load can never repopulate caches after an unload.
+    private var modelUnloadGeneration: UInt64 = 0
+    private var tokenizerUnloadGeneration: UInt64 = 0
+    private var tokenizerLoadTask: Task<GemmaTokenizer, any Error>?
+    private var tableLoadTask: Task<(Data, [Float]), any Error>?
+    private var bucketLoadTasks: [Int: Task<SendableMLModel, any Error>] = [:]
+
     public init(
         modelDirectory: URL? = nil,
         modelID: String = CoreMLEmbeddingModel.defaultModelID,
@@ -298,9 +308,14 @@ public actor CoreMLEmbeddingModel: EmbeddingModel {
     }
 
     /// Drops CoreML bucket handles and the memory-mapped token table to free RAM
-    /// on backgrounding or memory warnings while retaining the compact scalar
-    /// tokeniser (~16 MB) so returning to read does not re-parse 32 MB of JSON.
+    /// on backgrounding, idle timeout, or memory warnings while retaining the
+    /// compact scalar tokeniser (~16 MB) so returning does not re-parse 32 MB JSON.
     public func unloadModels() {
+        modelUnloadGeneration &+= 1
+        tableLoadTask?.cancel()
+        tableLoadTask = nil
+        for task in bucketLoadTasks.values { task.cancel() }
+        bucketLoadTasks.removeAll()
         loadedBuckets.removeAll()
         bucketUseOrder.removeAll()
         tokenTableData = nil
@@ -310,27 +325,43 @@ public actor CoreMLEmbeddingModel: EmbeddingModel {
     /// Releases every cached resource, including the tokeniser.
     public func unloadAll() {
         unloadModels()
+        tokenizerUnloadGeneration &+= 1
+        tokenizerLoadTask?.cancel()
+        tokenizerLoadTask = nil
         tokenizer = nil
     }
 
-    /// Preloads the tokeniser, token table, and resident `embed_512` CoreML
-    /// function so the first live query does not stall on cold load/compile.
-    /// No-op when the model is not installed on disk or already resident.
-    public func prewarm() {
-        guard isInstalledOnDisk() else { return }
+    /// True when the tokeniser, token table, and resident `embed_512` handle are
+    /// all currently loaded in memory.
+    public func isModelResident() -> Bool {
         let bucket = Self.bucket(forLength: Limits.maxSequenceLength)
-        if tokenizer != nil, tokenTableData != nil, rowScales != nil, loadedBuckets[bucket] != nil {
-            return
-        }
-        guard !Task.isCancelled else { return }
+        return tokenizer != nil
+            && tokenTableData != nil
+            && rowScales != nil
+            && loadedBuckets[bucket] != nil
+    }
+
+    /// Asynchronously preloads the tokeniser, token table, and resident
+    /// `embed_512` CoreML function off-actor so live queries do not stall on
+    /// cold load/compile. Returns `true` when resident.
+    @discardableResult
+    public func prewarm() async -> Bool {
+        guard isInstalledOnDisk() else { return false }
+        let bucket = Self.bucket(forLength: Limits.maxSequenceLength)
+        if isModelResident() { return true }
+        guard !Task.isCancelled else { return false }
         do {
-            try ensureRuntimeLoaded()
-            guard !Task.isCancelled else { return }
-            _ = try modelForBucket(bucket)
+            _ = try await ensureRuntimeLoaded()
+            guard !Task.isCancelled else { return false }
+            _ = try await modelForBucket(bucket)
+            return isModelResident()
+        } catch is CancellationError {
+            return false
         } catch {
             IssaLog.info("ask embedding prewarm skipped", [
                 "kind": String(describing: type(of: error)),
             ])
+            return false
         }
     }
 
@@ -340,27 +371,31 @@ public actor CoreMLEmbeddingModel: EmbeddingModel {
         guard !texts.isEmpty else { return [] }
         guard isInstalledOnDisk() else { throw ModelError.modelNotInstalled }
 
-        try ensureRuntimeLoaded()
-        guard let tokenizer, let tokenTableData, let rowScales else {
-            throw ModelError.modelNotInstalled
-        }
-
+        let runtime = try await ensureRuntimeLoaded()
         let prefix = mode == .query ? Self.queryPrefix : Self.documentPrefix
         var results: [[Float]] = []
         results.reserveCapacity(texts.count)
 
+        // Reuse one pair of scratch `MLMultiArray` buffers across the batch so
+        // an 8-span burst doesn't allocate/zero 4 MB of transient IOSurfaces.
+        let defaultBucket = Self.bucket(forLength: Limits.maxSequenceLength)
+        var scratch = try Self.makeScratchBuffers(bucket: defaultBucket)
+
         for text in texts {
             try Task.checkCancellation()
-            let ids = tokenizer.encode(prefix + text, maxLength: Limits.maxSequenceLength)
+            let ids = runtime.tokenizer.encode(prefix + text, maxLength: Limits.maxSequenceLength)
             let bucket = Self.bucket(forLength: ids.count)
-            let model = try modelForBucket(bucket)
+            let model = try await modelForBucket(bucket)
+            if scratch.bucket != bucket {
+                scratch = try Self.makeScratchBuffers(bucket: bucket)
+            }
             let vector = try await Self.runSingle(
                 tokenIDs: ids,
-                unkTokenID: Int(tokenizer.unkTokenID),
-                bucket: bucket,
+                unkTokenID: Int(runtime.tokenizer.unkTokenID),
+                scratch: &scratch,
                 model: model,
-                tableData: tokenTableData,
-                scales: rowScales,
+                tableData: runtime.tableData,
+                scales: runtime.scales,
             )
             results.append(vector)
         }
@@ -369,6 +404,19 @@ public actor CoreMLEmbeddingModel: EmbeddingModel {
 
     // MARK: - Private Runtime Helpers
 
+    private struct LoadedRuntime: Sendable {
+        let tokenizer: GemmaTokenizer
+        let tableData: Data
+        let scales: [Float]
+    }
+
+    private struct ScratchBuffers {
+        let bucket: Int
+        let embeds: MLMultiArray
+        let mask: MLMultiArray
+        var previousSeqLength: Int
+    }
+
     static func bucket(forLength count: Int) -> Int {
         for size in Limits.supportedBuckets where count <= size {
             return size
@@ -376,58 +424,127 @@ public actor CoreMLEmbeddingModel: EmbeddingModel {
         return Limits.maxSequenceLength
     }
 
-    private func ensureRuntimeLoaded() throws {
-        let clock = ContinuousClock()
-        var tokenizerMs: Int?
-        var tableMs: Int?
-        if tokenizer == nil {
-            let start = clock.now
-            let tokeniserURL = modelDirectory.appending(path: "text/tokenizer.json")
-            tokenizer = try GemmaTokenizer(contentsOf: tokeniserURL)
-            tokenizerMs = Self.milliseconds(since: start, on: clock)
-        }
-        let tableStart = clock.now
-        var loadedTable = false
-        if tokenTableData == nil {
-            let tableURL = modelDirectory.appending(path: "text/embeddings.int8")
-            let mapped = try Data(contentsOf: tableURL, options: .mappedIfSafe)
-            let expectedBytes = Limits.vocabSize * Limits.hiddenSize
-            guard mapped.count == expectedBytes else {
-                throw ModelError.corruptAsset
-            }
-            tokenTableData = mapped
-            loadedTable = true
-        }
-        if rowScales == nil {
-            let scaleURL = modelDirectory.appending(path: "text/embeddings.int8.scale.f16")
-            let raw = try Data(contentsOf: scaleURL)
-            let expectedBytes = Limits.vocabSize * MemoryLayout<UInt16>.size
-            guard raw.count == expectedBytes else {
-                throw ModelError.corruptAsset
-            }
-            rowScales = raw.withUnsafeBytes { buffer in
-                var scales = [Float](repeating: 0, count: Limits.vocabSize)
-                for index in 0..<Limits.vocabSize {
-                    let bits = buffer.loadUnaligned(fromByteOffset: index * 2, as: UInt16.self)
-                    let half = EmbeddingMath.HalfFloat.toFloat(UInt16(littleEndian: bits))
-                    scales[index] = half * Limits.embedScale
-                }
-                return scales
-            }
-            loadedTable = true
-        }
-        if loadedTable {
-            tableMs = Self.milliseconds(since: tableStart, on: clock)
-        }
-        if tokenizerMs != nil || tableMs != nil {
-            var fields: [String: String] = ["model": modelID]
-            if let tokenizerMs { fields["tokenizerMs"] = String(tokenizerMs) }
-            if let tableMs { fields["tableMs"] = String(tableMs) }
-            IssaLog.info("ask embedding runtime loaded", fields)
-        }
+    private func ensureRuntimeLoaded() async throws -> LoadedRuntime {
+        let loadedTokenizer = try await loadTokenizer()
+        let (tableData, scales) = try await loadTokenTable()
+        return LoadedRuntime(tokenizer: loadedTokenizer, tableData: tableData, scales: scales)
     }
 
-    private func modelForBucket(_ bucket: Int) throws -> SendableMLModel {
+    private func loadTokenizer() async throws -> GemmaTokenizer {
+        if let tokenizer { return tokenizer }
+        let generation = tokenizerUnloadGeneration
+        let task: Task<GemmaTokenizer, any Error>
+        if let existing = tokenizerLoadTask {
+            task = existing
+        } else {
+            let url = modelDirectory.appending(path: "text/tokenizer.json")
+            let modelID = self.modelID
+            let created = Task<GemmaTokenizer, any Error> {
+                try await Self.loadTokenizerOffActor(from: url, modelID: modelID)
+            }
+            tokenizerLoadTask = created
+            task = created
+        }
+        let loaded: GemmaTokenizer
+        do {
+            loaded = try await task.value
+        } catch {
+            if tokenizerUnloadGeneration == generation {
+                tokenizerLoadTask = nil
+            }
+            throw error
+        }
+        guard tokenizerUnloadGeneration == generation else {
+            throw CancellationError()
+        }
+        tokenizer = loaded
+        tokenizerLoadTask = nil
+        return loaded
+    }
+
+    private nonisolated static func loadTokenizerOffActor(
+        from url: URL, modelID: String,
+    ) async throws -> GemmaTokenizer {
+        let clock = ContinuousClock()
+        let start = clock.now
+        let parsed = try GemmaTokenizer(contentsOf: url)
+        IssaLog.info("ask embedding runtime loaded", [
+            "model": modelID,
+            "tokenizerMs": String(milliseconds(since: start, on: clock)),
+        ])
+        return parsed
+    }
+
+    private func loadTokenTable() async throws -> (Data, [Float]) {
+        if let tokenTableData, let rowScales {
+            return (tokenTableData, rowScales)
+        }
+        let generation = modelUnloadGeneration
+        let task: Task<(Data, [Float]), any Error>
+        if let existing = tableLoadTask {
+            task = existing
+        } else {
+            let tableURL = modelDirectory.appending(path: "text/embeddings.int8")
+            let scaleURL = modelDirectory.appending(path: "text/embeddings.int8.scale.f16")
+            let modelID = self.modelID
+            let created = Task<(Data, [Float]), any Error> {
+                try await Self.loadTokenTableOffActor(
+                    tableURL: tableURL, scaleURL: scaleURL, modelID: modelID,
+                )
+            }
+            tableLoadTask = created
+            task = created
+        }
+        let loaded: (Data, [Float])
+        do {
+            loaded = try await task.value
+        } catch {
+            if modelUnloadGeneration == generation {
+                tableLoadTask = nil
+            }
+            throw error
+        }
+        guard modelUnloadGeneration == generation else {
+            throw CancellationError()
+        }
+        tokenTableData = loaded.0
+        rowScales = loaded.1
+        tableLoadTask = nil
+        return loaded
+    }
+
+    private nonisolated static func loadTokenTableOffActor(
+        tableURL: URL, scaleURL: URL, modelID: String,
+    ) async throws -> (Data, [Float]) {
+        let clock = ContinuousClock()
+        let start = clock.now
+        let mapped = try Data(contentsOf: tableURL, options: .mappedIfSafe)
+        let expectedTableBytes = Limits.vocabSize * Limits.hiddenSize
+        guard mapped.count == expectedTableBytes else {
+            throw ModelError.corruptAsset
+        }
+        let raw = try Data(contentsOf: scaleURL)
+        let expectedScaleBytes = Limits.vocabSize * MemoryLayout<UInt16>.size
+        guard raw.count == expectedScaleBytes else {
+            throw ModelError.corruptAsset
+        }
+        let scales = raw.withUnsafeBytes { buffer in
+            var out = [Float](repeating: 0, count: Limits.vocabSize)
+            for index in 0..<Limits.vocabSize {
+                let bits = buffer.loadUnaligned(fromByteOffset: index * 2, as: UInt16.self)
+                let half = EmbeddingMath.HalfFloat.toFloat(UInt16(littleEndian: bits))
+                out[index] = half * Limits.embedScale
+            }
+            return out
+        }
+        IssaLog.info("ask embedding runtime loaded", [
+            "model": modelID,
+            "tableMs": String(milliseconds(since: start, on: clock)),
+        ])
+        return (mapped, scales)
+    }
+
+    private func modelForBucket(_ bucket: Int) async throws -> SendableMLModel {
         if let existing = loadedBuckets[bucket] {
             if let position = bucketUseOrder.firstIndex(of: bucket) {
                 bucketUseOrder.remove(at: position)
@@ -436,29 +553,60 @@ public actor CoreMLEmbeddingModel: EmbeddingModel {
             return existing
         }
 
+        let generation = modelUnloadGeneration
+        let task: Task<SendableMLModel, any Error>
+        if let existingTask = bucketLoadTasks[bucket] {
+            task = existingTask
+        } else {
+            let compiledURL = modelDirectory.appending(
+                path: "text/EmbeddingGemma2Text.mlmodelc",
+                directoryHint: .isDirectory,
+            )
+            let created = Task<SendableMLModel, any Error> {
+                try await Self.loadBucketOffActor(compiledURL: compiledURL, bucket: bucket)
+            }
+            bucketLoadTasks[bucket] = created
+            task = created
+        }
+
+        let loaded: SendableMLModel
+        do {
+            loaded = try await task.value
+        } catch {
+            if modelUnloadGeneration == generation {
+                bucketLoadTasks.removeValue(forKey: bucket)
+            }
+            throw error
+        }
+
+        guard modelUnloadGeneration == generation else {
+            throw CancellationError()
+        }
+
         while loadedBuckets.count >= Limits.maxLoadedBuckets, let oldest = bucketUseOrder.first {
             bucketUseOrder.removeFirst()
             loadedBuckets.removeValue(forKey: oldest)
         }
+        loadedBuckets[bucket] = loaded
+        bucketUseOrder.append(bucket)
+        bucketLoadTasks.removeValue(forKey: bucket)
+        return loaded
+    }
 
+    private nonisolated static func loadBucketOffActor(
+        compiledURL: URL, bucket: Int,
+    ) async throws -> SendableMLModel {
         let clock = ContinuousClock()
         let start = clock.now
-        let compiledURL = modelDirectory.appending(
-            path: "text/EmbeddingGemma2Text.mlmodelc",
-            directoryHint: .isDirectory,
-        )
         let config = MLModelConfiguration()
         config.computeUnits = .cpuAndNeuralEngine
         config.functionName = "embed_\(bucket)"
-
-        let loaded = SendableMLModel(model: try MLModel(contentsOf: compiledURL, configuration: config))
+        let loaded = try await MLModel.load(contentsOf: compiledURL, configuration: config)
         IssaLog.info("ask embedding bucket loaded", [
             "bucket": String(bucket),
-            "ms": String(Self.milliseconds(since: start, on: clock)),
+            "ms": String(milliseconds(since: start, on: clock)),
         ])
-        loadedBuckets[bucket] = loaded
-        bucketUseOrder.append(bucket)
-        return loaded
+        return SendableMLModel(model: loaded)
     }
 
     private static func milliseconds(since start: ContinuousClock.Instant, on clock: ContinuousClock) -> Int {
@@ -466,14 +614,7 @@ public actor CoreMLEmbeddingModel: EmbeddingModel {
         return Int(elapsed.components.seconds * 1_000 + elapsed.components.attoseconds / 1_000_000_000_000_000)
     }
 
-    private nonisolated static func runSingle(
-        tokenIDs: [Int32],
-        unkTokenID: Int,
-        bucket: Int,
-        model: SendableMLModel,
-        tableData: Data,
-        scales: [Float],
-    ) async throws -> [Float] {
+    private nonisolated static func makeScratchBuffers(bucket: Int) throws -> ScratchBuffers {
         let embeds = try MLMultiArray(
             shape: [1, NSNumber(value: bucket), NSNumber(value: Limits.hiddenSize)],
             dataType: .float16,
@@ -482,20 +623,38 @@ public actor CoreMLEmbeddingModel: EmbeddingModel {
             shape: [1, NSNumber(value: bucket)],
             dataType: .float16,
         )
+        embeds.withUnsafeMutableBytes { rawBuffer, _ in
+            _ = rawBuffer.initializeMemory(as: UInt8.self, repeating: 0)
+        }
+        mask.withUnsafeMutableBytes { rawBuffer, _ in
+            _ = rawBuffer.initializeMemory(as: UInt8.self, repeating: 0)
+        }
+        return ScratchBuffers(bucket: bucket, embeds: embeds, mask: mask, previousSeqLength: 0)
+    }
 
+    private nonisolated static func runSingle(
+        tokenIDs: [Int32],
+        unkTokenID: Int,
+        scratch: inout ScratchBuffers,
+        model: SendableMLModel,
+        tableData: Data,
+        scales: [Float],
+    ) async throws -> [Float] {
+        let bucket = scratch.bucket
         let seqLength = min(tokenIDs.count, bucket)
+        let prevLength = scratch.previousSeqLength
         let oneBitPattern = EmbeddingMath.HalfFloat.oneBitPattern
         let safeUnk = (unkTokenID >= 0 && unkTokenID < Limits.vocabSize) ? unkTokenID : 0
 
         // Lock underlying buffers via `withUnsafeMutableBytes` and index with
         // CoreML's reported strides so ANE IOSurface padding is always respected.
-        embeds.withUnsafeMutableBytes { rawBuffer, strides in
+        var embedsValid = false
+        scratch.embeds.withUnsafeMutableBytes { rawBuffer, strides in
             guard let base = rawBuffer.baseAddress?.assumingMemoryBound(to: UInt16.self),
                   strides.count >= 3
             else { return }
             let rowStride = strides[1]
             let colStride = strides[2]
-            rawBuffer.initializeMemory(as: UInt8.self, repeating: 0)
 
             tableData.withUnsafeBytes { tableRaw in
                 guard let tableBase = tableRaw.baseAddress?.assumingMemoryBound(to: Int8.self) else { return }
@@ -510,23 +669,41 @@ public actor CoreMLEmbeddingModel: EmbeddingModel {
                         base[dstRow + col * colStride] = EmbeddingMath.HalfFloat.fromFloat(scaled)
                     }
                 }
+                if seqLength < prevLength {
+                    for pos in seqLength..<prevLength {
+                        let dstRow = pos * rowStride
+                        for col in 0..<Limits.hiddenSize {
+                            base[dstRow + col * colStride] = 0
+                        }
+                    }
+                }
+                embedsValid = true
             }
         }
+        guard embedsValid else { throw ModelError.inferenceFailed }
 
-        mask.withUnsafeMutableBytes { rawBuffer, strides in
+        var maskValid = false
+        scratch.mask.withUnsafeMutableBytes { rawBuffer, strides in
             guard let base = rawBuffer.baseAddress?.assumingMemoryBound(to: UInt16.self),
                   strides.count >= 2
             else { return }
             let posStride = strides[1]
-            rawBuffer.initializeMemory(as: UInt8.self, repeating: 0)
             for pos in 0..<seqLength {
                 base[pos * posStride] = oneBitPattern
             }
+            if seqLength < prevLength {
+                for pos in seqLength..<prevLength {
+                    base[pos * posStride] = 0
+                }
+            }
+            maskValid = true
         }
+        guard maskValid else { throw ModelError.inferenceFailed }
+        scratch.previousSeqLength = seqLength
 
         let input = try MLDictionaryFeatureProvider(dictionary: [
-            "inputs_embeds": MLFeatureValue(multiArray: embeds),
-            "attention_mask": MLFeatureValue(multiArray: mask),
+            "inputs_embeds": MLFeatureValue(multiArray: scratch.embeds),
+            "attention_mask": MLFeatureValue(multiArray: scratch.mask),
         ])
         let output = try await model.model.prediction(from: input)
         guard let embArray = output.featureValue(for: "embedding")?.multiArrayValue else {
@@ -534,9 +711,11 @@ public actor CoreMLEmbeddingModel: EmbeddingModel {
         }
 
         let dim = min(Limits.embeddingDim, embArray.count)
+        guard dim == Limits.embeddingDim else { throw ModelError.inferenceFailed }
         let elemStride = embArray.strides.last?.intValue ?? 1
         var rawVector = [Float](repeating: 0, count: dim)
 
+        var outputValid = false
         embArray.withUnsafeBytes { rawBuffer in
             switch embArray.dataType {
             case .float16:
@@ -544,18 +723,35 @@ public actor CoreMLEmbeddingModel: EmbeddingModel {
                 for index in 0..<dim {
                     rawVector[index] = EmbeddingMath.HalfFloat.toFloat(ptr[index * elemStride])
                 }
+                outputValid = true
             case .float32:
                 guard let ptr = rawBuffer.baseAddress?.assumingMemoryBound(to: Float.self) else { return }
                 for index in 0..<dim {
                     rawVector[index] = ptr[index * elemStride]
                 }
+                outputValid = true
             default:
                 for index in 0..<dim {
                     rawVector[index] = embArray[index].floatValue
                 }
+                outputValid = true
             }
         }
-        return EmbeddingMath.l2Normalize(rawVector)
+        guard outputValid else { throw ModelError.inferenceFailed }
+
+        let normalized = EmbeddingMath.l2Normalize(rawVector)
+        guard Self.isValidVector(normalized) else { throw ModelError.inferenceFailed }
+        return normalized
+    }
+
+    static func isValidVector(_ vector: [Float]) -> Bool {
+        guard !vector.isEmpty else { return false }
+        var sumSq: Float = 0
+        for value in vector {
+            guard value.isFinite else { return false }
+            sumSq += value * value
+        }
+        return sumSq > 1e-6
     }
 
     // MARK: - Off-Actor Download & Verification
