@@ -127,6 +127,21 @@ public struct AskProfile: Sendable, Hashable, Codable {
             useRRF: true,
             embeddingDim: nil,
         )
+
+        /// Semantic retrieval for reader-owned providers (OpenAI / Anthropic):
+        /// sends up to 45 semantic scenes + 8 recent spans (~15–20K tokens)
+        /// when the book's read spans are embedded, while keeping upstream's
+        /// exact provider instructions, prompt style, reminder, and `searchBook`
+        /// tool untouched — and falling back to upstream's whole-book
+        /// `everythingRead` whenever embeddings are not installed or catching up.
+        public static let provider = SemanticOptions(
+            excerptLimit: 45,
+            passageCeiling: 20_000,
+            recencySpans: 8,
+            neighbourRadius: 1,
+            useRRF: true,
+            embeddingDim: nil,
+        )
     }
 
     /// For `.sandwich`: the rules, said again after the question.

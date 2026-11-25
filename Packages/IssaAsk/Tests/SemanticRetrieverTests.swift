@@ -389,6 +389,13 @@ struct SemanticRetrieverTests {
         #expect(decoded.semantic == nil)
         #expect(AskProfile.cloud.withSemantic(.cloud).instructions == AskProfile.cloud.instructions)
         #expect(AskProfile.cloud.withSemantic(.cloud).usesSearchTool == AskProfile.cloud.usesSearchTool)
+        let openAIBase = AskProfile.provider(kind: .openAI, shape: .everythingRead)
+        let openAISem = openAIBase.withSemantic(.provider)
+        #expect(openAISem.instructions == openAIBase.instructions)
+        #expect(openAISem.reminder == openAIBase.reminder)
+        #expect(openAISem.promptStyle == openAIBase.promptStyle)
+        #expect(openAISem.usesSearchTool == openAIBase.usesSearchTool)
+        #expect(openAISem.shape == .everythingRead)
     }
 
     @Test("embedNextBatch respects upToSpine and afterSpine scopes and rejects zero/NaN vectors")

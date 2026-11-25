@@ -720,16 +720,20 @@ final class AskCoordinator {
                 finished(job)
                 return job
             }
-            // Keep reader-owned providers (OpenAI / Anthropic) on upstream's
-            // whole-book `everythingRead` profile + `searchBook` tool — their
-            // 200K–1M context windows outperform passage retrieval (94–97% vs
-            // 60–71% in the 1.8.0 study). On-device embeddings supercharge the
-            // 4K device and 32K Apple cloud windows instead.
-            let providerProfile = AskProfile.provider(for: provider.entry, kind: kind)
+            // Layer optional on-device semantic retrieval onto upstream's exact
+            // provider profile (keeping upstream's prompt style, instructions,
+            // reminder, and `searchBook` tool untouched). Whenever the search
+            // model is not installed or read spans are still catching up
+            // (> 16 missing), `AskEngine` falls straight back to upstream's
+            // whole-book `everythingRead` path.
+            let baseProviderProfile = AskProfile.provider(for: provider.entry, kind: kind)
+            let providerProfile = embedder != nil
+                ? baseProviderProfile.withSemantic(.provider)
+                : baseProviderProfile
             engine = AskEngine.forQuestion(
                 model: provider.model, store: store, bookUUID: uuid, boundary: boundary,
                 turnstile: providerTurnstile(for: kind), profile: providerProfile,
-                package: source.package,
+                package: source.package, embedder: embedder,
             )
             job.providerModelName = provider.entry.displayName
         }
