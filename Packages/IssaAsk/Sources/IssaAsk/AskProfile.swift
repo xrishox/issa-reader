@@ -70,6 +70,7 @@ public struct AskProfile: Sendable, Hashable, Codable {
         public var excerptLimit: Int?
         public var passageCeiling: Int?
         public var recencySpans: Int
+        public var neighbourRadius: Int
         public var useRRF: Bool
         public var embeddingDim: Int?
         /// Optional override instructions used *only* when semantic retrieval
@@ -83,6 +84,7 @@ public struct AskProfile: Sendable, Hashable, Codable {
             excerptLimit: Int? = nil,
             passageCeiling: Int? = nil,
             recencySpans: Int = 3,
+            neighbourRadius: Int = 1,
             useRRF: Bool = true,
             embeddingDim: Int? = nil,
             instructions: String? = nil,
@@ -91,19 +93,38 @@ public struct AskProfile: Sendable, Hashable, Codable {
             self.excerptLimit = excerptLimit
             self.passageCeiling = passageCeiling
             self.recencySpans = recencySpans
+            self.neighbourRadius = neighbourRadius
             self.useRRF = useRRF
             self.embeddingDim = embeddingDim
             self.instructions = instructions
             self.disablesSearchTool = disablesSearchTool
         }
 
-        /// Measured across 8 novels (400 Qs) on Apple's 4K on-device model:
-        /// 8 ~210-word spans (~2,800 tokens), 3 current-chapter recency spans
-        /// (last 2 pinned ahead of secondary hits), clean `instructionsWithoutExample`.
+        private enum CodingKeys: String, CodingKey {
+            case excerptLimit, passageCeiling, recencySpans, neighbourRadius, useRRF,
+                 embeddingDim, instructions, disablesSearchTool
+        }
+
+        public init(from decoder: any Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            excerptLimit = try c.decodeIfPresent(Int.self, forKey: .excerptLimit)
+            passageCeiling = try c.decodeIfPresent(Int.self, forKey: .passageCeiling)
+            recencySpans = try c.decodeIfPresent(Int.self, forKey: .recencySpans) ?? 3
+            neighbourRadius = try c.decodeIfPresent(Int.self, forKey: .neighbourRadius) ?? 1
+            useRRF = try c.decodeIfPresent(Bool.self, forKey: .useRRF) ?? true
+            embeddingDim = try c.decodeIfPresent(Int.self, forKey: .embeddingDim)
+            instructions = try c.decodeIfPresent(String.self, forKey: .instructions)
+            disablesSearchTool = try c.decodeIfPresent(Bool.self, forKey: .disablesSearchTool) ?? true
+        }
+
+        /// On Apple's 4K on-device window, keep `neighbourRadius = 0` so all
+        /// 10 excerpt slots go to distinct top semantic scenes rather than
+        /// filling 5 of 8 slots with `±1` neighbours around just 3 scenes.
         public static let device = SemanticOptions(
-            excerptLimit: 8,
-            passageCeiling: 2_800,
-            recencySpans: 3,
+            excerptLimit: 10,
+            passageCeiling: 2_900,
+            recencySpans: 2,
+            neighbourRadius: 0,
             useRRF: true,
             embeddingDim: nil,
             instructions: nil,
@@ -115,6 +136,7 @@ public struct AskProfile: Sendable, Hashable, Codable {
             excerptLimit: 40,
             passageCeiling: 20_000,
             recencySpans: 6,
+            neighbourRadius: 1,
             useRRF: true,
             embeddingDim: nil,
             instructions: AskPromptBuilder.instructionsAnchored,

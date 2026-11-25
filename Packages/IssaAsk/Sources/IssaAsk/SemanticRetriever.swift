@@ -140,7 +140,7 @@ public struct SemanticRetriever: Sendable {
             ftsHits: ftsHits,
             boundary: boundary,
             limit: limit,
-            neighbourRadius: Limits.neighbourRadius,
+            neighbourRadius: options.neighbourRadius,
             neighbourTopK: min(Limits.neighbourTopK, limit),
             recencySpans: options.recencySpans,
             rrfK: Limits.rrfK,

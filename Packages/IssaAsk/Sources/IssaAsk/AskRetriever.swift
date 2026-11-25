@@ -197,6 +197,17 @@ public struct AskRetriever: Sendable {
                     options: semanticOptions,
                     fallbackLimit: limit,
                 ), !semantic.isEmpty {
+                    // For identity questions ("Who is X?"), preserve upstream's
+                    // top earliest-introduction passages alongside semantic hits
+                    // so character introductions are never displaced on long books.
+                    if case .identity = terms.kind {
+                        let introEvidence = (try? await evidence(for: terms, limit: 2)) ?? []
+                        let merged = Self.mergingIdentityIntros(
+                            EvidenceFinder.ranked(introEvidence),
+                            into: semantic,
+                        )
+                        return (.evidence(merged, kind: terms.kind), true)
+                    }
                     return (.evidence(semantic, kind: terms.kind), true)
                 }
             } catch is CancellationError {
@@ -228,6 +239,32 @@ public struct AskRetriever: Sendable {
             ),
             false,
         )
+    }
+
+    /// Blends upstream's earliest-introduction passages for `.identity` questions
+    /// into semantic spans at top priority (`0`), skipping any passage whose
+    /// character range is already covered by a semantic span, and preserving
+    /// reading order.
+    static func mergingIdentityIntros(
+        _ intros: [PassageRanker.Ranked],
+        into semantic: [PassageRanker.Ranked],
+    ) -> [PassageRanker.Ranked] {
+        guard !intros.isEmpty else { return semantic }
+        var combined = semantic
+        for intro in intros {
+            let p = intro.retrieved.passage
+            let alreadyCovered = semantic.contains { item in
+                let s = item.retrieved.passage
+                return s.spineIndex == p.spineIndex && p.start >= s.start && p.end <= s.end
+            }
+            if !alreadyCovered {
+                combined.append(PassageRanker.Ranked(retrieved: intro.retrieved, priority: 0))
+            }
+        }
+        return combined.sorted {
+            let a = $0.retrieved.passage, b = $1.retrieved.passage
+            return (a.spineIndex, a.start, a.ordinal) < (b.spineIndex, b.start, b.ordinal)
+        }
     }
 
     /// The recent passages that are in the spine item the reader is in.
