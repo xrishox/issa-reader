@@ -105,6 +105,7 @@ enum ProviderHTTP {
     static let openAIOutOfCreditCodes: Set<String> = [
         "insufficient_quota", "credit_balance_exhausted", "organization_spend_limit_exceeded",
         "project_spend_limit_exceeded", "organization_usage_limit_exceeded", "billing_hard_limit_reached",
+        "subscription_sharing_usage_limit_exceeded",
     ]
 
     /// What an error response means to a reader.

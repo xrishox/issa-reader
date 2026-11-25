@@ -19,7 +19,7 @@ import IssaCore
 public final class ProviderAnswerModel: AnswerModel {
     public let kind: ProviderKind
     public let model: ProviderModel
-    private let key: String
+    private let tokenProvider: @Sendable (_ forceRefresh: Bool) async throws -> String
     private let session: URLSession
     /// Told each turn's token counts, for the provider study's cost record.
     /// Nil in the app, which only logs them.
@@ -31,7 +31,20 @@ public final class ProviderAnswerModel: AnswerModel {
     ) {
         self.kind = kind
         self.model = model
-        self.key = key
+        self.tokenProvider = { _ in key }
+        self.session = session ?? ProviderHTTP.defaultSession
+        self.onUsage = onUsage
+    }
+
+    public init(
+        kind: ProviderKind, model: ProviderModel,
+        tokenProvider: @escaping @Sendable (_ forceRefresh: Bool) async throws -> String,
+        session: URLSession? = nil,
+        onUsage: (@Sendable ([String: String]) -> Void)? = nil,
+    ) {
+        self.kind = kind
+        self.model = model
+        self.tokenProvider = tokenProvider
         self.session = session ?? ProviderHTTP.defaultSession
         self.onUsage = onUsage
     }
@@ -51,6 +64,7 @@ public final class ProviderAnswerModel: AnswerModel {
     public func exactTokenCount(instructions: String, prompt: String, tools: [any AskTool]) async -> Int? {
         let callable = tools.filter { $0.parametersJSONSchema != nil }
         do {
+            let key = try await tokenProvider(false)
             let request: URLRequest
             switch kind {
             case .anthropic:
@@ -95,7 +109,7 @@ public final class ProviderAnswerModel: AnswerModel {
         tools: [any AskTool],
         options: AskGenerationOptions,
     ) -> AsyncThrowingStream<String, any Error> {
-        let kind = kind, model = model, key = key, session = session
+        let kind = kind, model = model, tokenProvider = tokenProvider, session = session
         let usage: @Sendable ([String: String]) -> Void = { [onUsage] counts in onUsage?(counts) }
         return AsyncThrowingStream { continuation in
             let task = Task {
@@ -103,6 +117,7 @@ public final class ProviderAnswerModel: AnswerModel {
                 do {
                     switch kind {
                     case .anthropic:
+                        let key = try await tokenProvider(false)
                         try await AnthropicWire.run(
                             model: model, key: key, session: session, instructions: instructions,
                             prompt: prompt, tools: tools, options: options,
@@ -110,7 +125,7 @@ public final class ProviderAnswerModel: AnswerModel {
                         )
                     case .openAI:
                         try await OpenAIWire.run(
-                            model: model, key: key, session: session, instructions: instructions,
+                            model: model, tokenProvider: tokenProvider, session: session, instructions: instructions,
                             prompt: prompt, tools: tools, options: options,
                             emit: { continuation.yield($0) }, usage: usage,
                         )
@@ -191,10 +206,20 @@ public enum ProviderCatalog {
                 let failure = ProviderHTTP.failure(kind, ProviderHTTP.APIError(status: status, body: data))
                 throw Failure.other(failure.message(deviceNoun: "device", answerer: AskAnswerer(kind)))
             }
-            guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let entries = object["data"] as? [[String: Any]]
-            else { throw Failure.unreachable }
-            models += entries.compactMap { parse($0, kind: kind) }
+            guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw Failure.unreachable
+            }
+            if let entries = object["data"] as? [[String: Any]] {
+                models += entries.compactMap { parse($0, kind: kind) }
+            } else if kind == .openAI, let entries = object["models"] as? [[String: Any]] {
+                // Sign in with ChatGPT OAuth tokens receive `{ "models": [{ "slug", "display_name", "visibility" }] }`
+                // in server order rather than the API-key `{ "data": [{ "id" }] }` list.
+                let parsed = entries.compactMap(parseOpenAIOAuthModel)
+                guard !parsed.isEmpty else { throw Failure.noModels }
+                return prioritised(parsed, preferredID: kind.preferredModelID)
+            } else {
+                throw Failure.unreachable
+            }
             guard kind == .anthropic, object["has_more"] as? Bool == true,
                   let last = object["last_id"] as? String
             else { break }
@@ -202,6 +227,44 @@ public enum ProviderCatalog {
         }
         guard !models.isEmpty else { throw Failure.noModels }
         return sorted(models, kind: kind)
+    }
+
+    /// Preserves server-reported order while deduplicating and floating the
+    /// preferred model to the top when present.
+    static func prioritised(_ models: [ProviderModel], preferredID: String) -> [ProviderModel] {
+        var seen: Set<String> = []
+        let unique = models.filter { seen.insert($0.id).inserted }
+        guard let index = unique.firstIndex(where: { $0.id == preferredID }), index > 0 else {
+            return unique
+        }
+        var reordered = unique
+        let preferred = reordered.remove(at: index)
+        reordered.insert(preferred, at: 0)
+        return reordered
+    }
+
+    /// Parses one entry from the Sign in with ChatGPT `/v1/models` catalog.
+    static func parseOpenAIOAuthModel(_ entry: [String: Any]) -> ProviderModel? {
+        if let visibility = entry["visibility"] as? String, visibility != "list" {
+            return nil
+        }
+        guard let slug = (entry["slug"] as? String) ?? (entry["id"] as? String),
+              isOpenAITextModel(slug)
+        else { return nil }
+        let displayName = (entry["display_name"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            ?? openAIDisplayName(slug)
+        let contextSize = (entry["context_window"] as? Int)
+            ?? (entry["max_input_tokens"] as? Int)
+            ?? openAIContextSize(slug)
+        let reasoningLevels = entry["supported_reasoning_levels"] as? [Any]
+        let supportsEffort = (reasoningLevels.map { !$0.isEmpty }) ?? isOpenAIReasoningModel(slug)
+        return ProviderModel(
+            id: slug,
+            displayName: displayName,
+            contextSize: contextSize,
+            created: nil,
+            supportsEffort: supportsEffort,
+        )
     }
 
     /// Newest first, with the preferred model leading.

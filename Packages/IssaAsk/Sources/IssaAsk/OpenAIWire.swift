@@ -113,19 +113,42 @@ enum OpenAIWire {
         emit: (String) -> Void,
         usage report: ([String: String]) -> Void = { _ in },
     ) async throws {
+        try await run(
+            model: model,
+            tokenProvider: { _ in key },
+            session: session,
+            instructions: instructions,
+            prompt: prompt,
+            tools: tools,
+            options: options,
+            emit: emit,
+            usage: report,
+        )
+    }
+
+    static func run(
+        model: ProviderModel,
+        tokenProvider: @Sendable (_ forceRefresh: Bool) async throws -> String,
+        session: URLSession,
+        instructions: String, prompt: String, tools: [any AskTool], options: AskGenerationOptions,
+        emit: (String) -> Void,
+        usage report: ([String: String]) -> Void = { _ in },
+    ) async throws {
         var input: [[String: Any]] = [firstMessage(prompt: prompt, cacheablePrefix: options.cacheablePrefix)]
         let callable = tools.filter { $0.parametersJSONSchema != nil }
         let callLimit = callable.map(\.callLimit).max() ?? 0
         var sendsReasoning = model.supportsEffort
+        var retriedAuth = false
         var calls = 0
         var turns = 0
-        // The searches, one turn to answer in, and one retry without reasoning.
-        while turns < callLimit + 3 {
+        // The searches, one turn to answer in, one retry without reasoning, and one auth refresh.
+        while turns < callLimit + 4 {
             turns += 1
             // This turn's text only: what a model writes before it searches is
             // not the answer (see `AnthropicWire.run`).
             var text = ""
             var turn = Turn()
+            let key = try await tokenProvider(false)
             do {
                 let body = try Self.body(
                     model: model, instructions: instructions, input: input, tools: callable,
@@ -139,6 +162,14 @@ enum OpenAIWire {
                     }
                 }
             } catch let ProviderStreamError.http(error) {
+                // An OAuth access token can be invalidated ahead of its expiry;
+                // refresh once silently before failing the question.
+                if error.status == 401, !retriedAuth, text.isEmpty {
+                    retriedAuth = true
+                    if let refreshed = try? await tokenProvider(true), refreshed != key {
+                        continue
+                    }
+                }
                 // A model that takes no reasoning setting says so in a 400
                 // naming the parameter. Asked once more without it.
                 if sendsReasoning, error.status == 400,
