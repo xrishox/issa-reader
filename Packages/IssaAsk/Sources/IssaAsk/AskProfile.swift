@@ -73,12 +73,6 @@ public struct AskProfile: Sendable, Hashable, Codable {
         public var neighbourRadius: Int
         public var useRRF: Bool
         public var embeddingDim: Int?
-        /// Optional override instructions used *only* when semantic retrieval
-        /// succeeds (e.g., adding the temporal-anchor rule on cloud/provider
-        /// models while omitting it on the 3B on-device model).
-        public var instructions: String?
-        /// Whether to strip `searchBook` tools when semantic retrieval succeeds.
-        public var disablesSearchTool: Bool
 
         public init(
             excerptLimit: Int? = nil,
@@ -87,8 +81,6 @@ public struct AskProfile: Sendable, Hashable, Codable {
             neighbourRadius: Int = 1,
             useRRF: Bool = true,
             embeddingDim: Int? = nil,
-            instructions: String? = nil,
-            disablesSearchTool: Bool = true,
         ) {
             self.excerptLimit = excerptLimit
             self.passageCeiling = passageCeiling
@@ -96,13 +88,10 @@ public struct AskProfile: Sendable, Hashable, Codable {
             self.neighbourRadius = neighbourRadius
             self.useRRF = useRRF
             self.embeddingDim = embeddingDim
-            self.instructions = instructions
-            self.disablesSearchTool = disablesSearchTool
         }
 
         private enum CodingKeys: String, CodingKey {
-            case excerptLimit, passageCeiling, recencySpans, neighbourRadius, useRRF,
-                 embeddingDim, instructions, disablesSearchTool
+            case excerptLimit, passageCeiling, recencySpans, neighbourRadius, useRRF, embeddingDim
         }
 
         public init(from decoder: any Decoder) throws {
@@ -113,13 +102,12 @@ public struct AskProfile: Sendable, Hashable, Codable {
             neighbourRadius = try c.decodeIfPresent(Int.self, forKey: .neighbourRadius) ?? 1
             useRRF = try c.decodeIfPresent(Bool.self, forKey: .useRRF) ?? true
             embeddingDim = try c.decodeIfPresent(Int.self, forKey: .embeddingDim)
-            instructions = try c.decodeIfPresent(String.self, forKey: .instructions)
-            disablesSearchTool = try c.decodeIfPresent(Bool.self, forKey: .disablesSearchTool) ?? true
         }
 
         /// On Apple's 4K on-device window, keep `neighbourRadius = 0` so all
         /// 10 excerpt slots go to distinct top semantic scenes rather than
         /// filling 5 of 8 slots with `±1` neighbours around just 3 scenes.
+        /// Upstream's exact instructions and tool configuration stay untouched.
         public static let device = SemanticOptions(
             excerptLimit: 10,
             passageCeiling: 2_900,
@@ -127,11 +115,10 @@ public struct AskProfile: Sendable, Hashable, Codable {
             neighbourRadius: 0,
             useRRF: true,
             embeddingDim: nil,
-            instructions: nil,
-            disablesSearchTool: true,
         )
 
-        /// Measured for Apple's 32K Private Cloud Compute window.
+        /// Semantic retrieval for Apple's 32K Private Cloud Compute window;
+        /// upstream's exact instructions and `searchBook` tool stay untouched.
         public static let cloud = SemanticOptions(
             excerptLimit: 40,
             passageCeiling: 20_000,
@@ -139,28 +126,7 @@ public struct AskProfile: Sendable, Hashable, Codable {
             neighbourRadius: 1,
             useRRF: true,
             embeddingDim: nil,
-            instructions: AskPromptBuilder.instructionsAnchored,
-            disablesSearchTool: true,
         )
-
-        /// Measured across 4 long novels + HP1 (~19K tokens, full 768d + RRF).
-        public static func provider(kind: ProviderKind?) -> SemanticOptions {
-            let anchored: String
-            switch kind {
-            case .anthropic: anchored = AskPromptBuilder.anthropicInstructionsAnchored
-            case .openAI: anchored = AskPromptBuilder.openAIInstructionsAnchored
-            case nil: anchored = AskPromptBuilder.instructionsAnchored
-            }
-            return SemanticOptions(
-                excerptLimit: 50,
-                passageCeiling: 20_000,
-                recencySpans: 6,
-                useRRF: true,
-                embeddingDim: nil,
-                instructions: anchored,
-                disablesSearchTool: true,
-            )
-        }
     }
 
     /// For `.sandwich`: the rules, said again after the question.

@@ -349,9 +349,7 @@ public actor AskEngine {
                 generated = try await generate(
                     question: sanitised, ranked: ranked, options: options,
                     bookUUID: source.bookUUID, boundary: boundary, render: render,
-                    instructionsOverride: semantic?.instructions,
                     passageCeilingOverride: semantic?.passageCeiling,
-                    disableTools: semantic?.disablesSearchTool ?? false,
                     into: continuation,
                 )
             }
@@ -730,14 +728,10 @@ public actor AskEngine {
         bookUUID: String,
         boundary: ReadingBoundary,
         render: @escaping AskPromptBuilder.Render = { $0.displayText },
-        instructionsOverride: String? = nil,
         passageCeilingOverride: Int? = nil,
-        disableTools: Bool = false,
         into continuation: AsyncThrowingStream<AskEvent, any Error>.Continuation,
     ) async throws -> AskAnswer {
-        let activeInstructions = instructionsOverride ?? self.profile.instructions
         let activeCeiling = passageCeilingOverride ?? self.profile.passageCeiling
-        let activeTools = disableTools ? [] : self.tools
         return try await turnstile.withTurn { () async throws -> AskAnswer in
             var lastFailure = AskFailure.tooMuchContext
             for attempt in Self.attempts(for: ranked) {
@@ -746,8 +740,8 @@ public actor AskEngine {
                     question: question,
                     ranked: attempt,
                     contextSize: self.model.contextSize,
-                    hasTool: !activeTools.isEmpty,
-                    instructions: activeInstructions,
+                    hasTool: !self.tools.isEmpty,
+                    instructions: self.profile.instructions,
                     passageCeiling: activeCeiling,
                     responseTokens: self.profile.responseTokens,
                     render: render,
@@ -757,14 +751,14 @@ public actor AskEngine {
                         try await model.tokenCount(for: text)
                     },
                 )
-                for tool in activeTools {
+                for tool in self.tools {
                     await tool.beginGeneration(numberingFrom: built.passages.count + 1)
                 }
 
                 do {
                     let answer = try await self.stream(
                         built, options: options, bookUUID: bookUUID, boundary: boundary,
-                        instructions: activeInstructions, tools: activeTools,
+                        instructions: self.profile.instructions, tools: self.tools,
                         into: continuation,
                     )
                     // Resolved here, inside the attempt that survived: the retry
@@ -772,7 +766,7 @@ public actor AskEngine {
                     // to is whichever one did not throw `.tooMuchContext`, and
                     // the two before it were built from more passages.
                     var shown = Self.numbered(built.passages)
-                    for tool in activeTools {
+                    for tool in self.tools {
                         // The tool's excerpts continue the prompt's numbering,
                         // so they never collide; merged last regardless, because
                         // a collision would mean the tool numbered over the

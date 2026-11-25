@@ -263,7 +263,7 @@ struct SemanticRetrieverTests {
             store: store,
             bookUUID: source.bookUUID,
             boundary: boundary,
-            profile: providerBase.withSemantic(.provider(kind: .openAI)),
+            profile: providerBase.withSemantic(.cloud),
             package: source.package,
             embedder: embedder,
         )
@@ -377,14 +377,8 @@ struct SemanticRetrieverTests {
         #expect(gotAnswer)
     }
 
-    @Test("anchored prompts differ from originals, strip searchBook, and AskProfile stays Codable-compatible")
-    func promptAnchorsAndProfileCodableCompatibility() throws {
-        #expect(AskPromptBuilder.instructionsAnchored != AskPromptBuilder.instructions)
-        #expect(AskPromptBuilder.openAIInstructionsAnchored != AskPromptBuilder.openAIInstructions)
-        #expect(AskPromptBuilder.anthropicInstructionsAnchored != AskPromptBuilder.anthropicInstructions)
-        #expect(!AskPromptBuilder.openAIInstructionsAnchored.contains("searchBook"))
-        #expect(!AskPromptBuilder.anthropicInstructionsAnchored.contains("searchBook"))
-
+    @Test("AskProfile stays Codable-compatible without semantic field and leaves upstream instructions untouched")
+    func profileCodableCompatibility() throws {
         // Legacy JSON without `semantic` decodes cleanly with `semantic == nil`.
         let encoded = try JSONEncoder().encode(AskProfile.device)
         var object = try #require(try JSONSerialization.jsonObject(with: encoded) as? [String: Any])
@@ -393,5 +387,7 @@ struct SemanticRetrieverTests {
         let decoded = try JSONDecoder().decode(AskProfile.self, from: legacyData)
         #expect(decoded.name == AskProfile.device.name)
         #expect(decoded.semantic == nil)
+        #expect(AskProfile.cloud.withSemantic(.cloud).instructions == AskProfile.cloud.instructions)
+        #expect(AskProfile.cloud.withSemantic(.cloud).usesSearchTool == AskProfile.cloud.usesSearchTool)
     }
 }
