@@ -79,12 +79,13 @@ struct CoreMLEmbeddingModelTests {
         #expect(CoreMLEmbeddingModel.bucket(forLength: 600) == 512)
     }
 
-    @Test("empty model directory reports notInstalled and refuses embed")
+    @Test("empty model directory reports notInstalled, prewarm is a safe no-op, and embed refuses")
     func missingDirectoryRefusesEmbed() async throws {
         let dir = try AskFixture.temporaryDirectory()
         defer { AskFixture.remove(dir) }
         let model = CoreMLEmbeddingModel(modelDirectory: dir)
         #expect(!model.isInstalledOnDisk())
+        await model.prewarm()
         await #expect(throws: CoreMLEmbeddingModel.ModelError.modelNotInstalled) {
             _ = try await model.embed(["hello"], mode: .query)
         }

@@ -109,6 +109,7 @@ final class AskCoordinator {
     private(set) var indexingBooks: Set<String> = []
     private var embeddingDownloadTask: Task<Void, Never>?
     private var embeddingDownloadToken: UUID?
+    private var embeddingPrewarmTask: (token: UUID, task: Task<Void, Never>)?
     private var pendingModelRemoval: Task<Void, Never>?
     /// Per-book background embedding tasks, paired with an identity token so a
     /// cancelled pass can never clear the handle of a newer chapter's pass.
@@ -384,6 +385,10 @@ final class AskCoordinator {
     }
 
     func prepare(source: BookSource) {
+        // Re-warm the CoreML embedding runtime whenever the Ask sheet opens
+        // (even on a book whose SQLite index is already `prepared`), because
+        // `appDidEnterBackground()` unloads CoreML buckets to keep RAM low.
+        prewarmEmbeddingModel(priority: .userInitiated)
         let uuid = source.bookUUID
         guard !prepared.contains(uuid), preparing[uuid] == nil else { return }
         // The device's model is warmed only where it can answer; a reader's
@@ -497,6 +502,7 @@ final class AskCoordinator {
 
     func removeEmbeddingModel() {
         cancelEmbeddingModelDownload()
+        cancelEmbeddingPrewarm()
         cancelAllBackgroundEmbeddings()
         embeddingModelState = .notInstalled
         if let client = coreMLEmbedder {
@@ -506,6 +512,31 @@ final class AskCoordinator {
                 await client.removeModel()
             }
         }
+    }
+
+    /// Warms up the on-device CoreML embedding runtime (`embed_512`) so the
+    /// first live Ask query doesn't pay the cold CoreML load/compile delay.
+    private func prewarmEmbeddingModel(priority: TaskPriority) {
+        guard isAppActive,
+              embeddingModelState.isReady,
+              let client = coreMLEmbedder,
+              embeddingPrewarmTask == nil
+        else { return }
+        let token = UUID()
+        let task = Task(priority: priority) { [weak self] in
+            await client.prewarm()
+            await MainActor.run {
+                if self?.embeddingPrewarmTask?.token == token {
+                    self?.embeddingPrewarmTask = nil
+                }
+            }
+        }
+        embeddingPrewarmTask = (token: token, task: task)
+    }
+
+    private func cancelEmbeddingPrewarm() {
+        embeddingPrewarmTask?.task.cancel()
+        embeddingPrewarmTask = nil
     }
 
     /// Called by `ReaderView` when its scene becomes active, avoiding a firing-
@@ -559,6 +590,9 @@ final class AskCoordinator {
                             self?.indexingBooks.remove(uuid)
                             self?.embeddingTasks.removeValue(forKey: uuid)
                         }
+                        // Book is already 100% embedded on disk; quietly warm
+                        // `embed_512` while reading so the first Ask doesn't stall.
+                        self?.prewarmEmbeddingModel(priority: .utility)
                     }
                     return
                 }
@@ -650,6 +684,7 @@ final class AskCoordinator {
     }
 
     private func handleMemoryWarning() {
+        cancelEmbeddingPrewarm()
         cancelAllBackgroundEmbeddings()
         if let client = coreMLEmbedder {
             Task { await client.unloadModels() }
@@ -1009,6 +1044,7 @@ final class AskCoordinator {
     /// exactly who the notification is for; the flag is set here too.
     func appDidEnterBackground() {
         isAppActive = false
+        cancelEmbeddingPrewarm()
         cancelAllBackgroundEmbeddings()
         if let client = coreMLEmbedder, !hasWorkingJob {
             Task { await client.unloadModels() }

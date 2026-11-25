@@ -313,6 +313,27 @@ public actor CoreMLEmbeddingModel: EmbeddingModel {
         tokenizer = nil
     }
 
+    /// Preloads the tokeniser, token table, and resident `embed_512` CoreML
+    /// function so the first live query does not stall on cold load/compile.
+    /// No-op when the model is not installed on disk or already resident.
+    public func prewarm() {
+        guard isInstalledOnDisk() else { return }
+        let bucket = Self.bucket(forLength: Limits.maxSequenceLength)
+        if tokenizer != nil, tokenTableData != nil, rowScales != nil, loadedBuckets[bucket] != nil {
+            return
+        }
+        guard !Task.isCancelled else { return }
+        do {
+            try ensureRuntimeLoaded()
+            guard !Task.isCancelled else { return }
+            _ = try modelForBucket(bucket)
+        } catch {
+            IssaLog.info("ask embedding prewarm skipped", [
+                "kind": String(describing: type(of: error)),
+            ])
+        }
+    }
+
     // MARK: - EmbeddingModel
 
     public func embed(_ texts: [String], mode: EmbeddingMode) async throws -> [[Float]] {
