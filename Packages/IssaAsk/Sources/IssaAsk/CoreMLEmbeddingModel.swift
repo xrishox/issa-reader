@@ -353,10 +353,17 @@ public actor CoreMLEmbeddingModel: EmbeddingModel {
     }
 
     private func ensureRuntimeLoaded() throws {
+        let clock = ContinuousClock()
+        var tokenizerMs: Int?
+        var tableMs: Int?
         if tokenizer == nil {
+            let start = clock.now
             let tokeniserURL = modelDirectory.appending(path: "text/tokenizer.json")
             tokenizer = try GemmaTokenizer(contentsOf: tokeniserURL)
+            tokenizerMs = Self.milliseconds(since: start, on: clock)
         }
+        let tableStart = clock.now
+        var loadedTable = false
         if tokenTableData == nil {
             let tableURL = modelDirectory.appending(path: "text/embeddings.int8")
             let mapped = try Data(contentsOf: tableURL, options: .mappedIfSafe)
@@ -365,6 +372,7 @@ public actor CoreMLEmbeddingModel: EmbeddingModel {
                 throw ModelError.corruptAsset
             }
             tokenTableData = mapped
+            loadedTable = true
         }
         if rowScales == nil {
             let scaleURL = modelDirectory.appending(path: "text/embeddings.int8.scale.f16")
@@ -382,6 +390,16 @@ public actor CoreMLEmbeddingModel: EmbeddingModel {
                 }
                 return scales
             }
+            loadedTable = true
+        }
+        if loadedTable {
+            tableMs = Self.milliseconds(since: tableStart, on: clock)
+        }
+        if tokenizerMs != nil || tableMs != nil {
+            var fields: [String: String] = ["model": modelID]
+            if let tokenizerMs { fields["tokenizerMs"] = String(tokenizerMs) }
+            if let tableMs { fields["tableMs"] = String(tableMs) }
+            IssaLog.info("ask embedding runtime loaded", fields)
         }
     }
 
@@ -399,6 +417,8 @@ public actor CoreMLEmbeddingModel: EmbeddingModel {
             loadedBuckets.removeValue(forKey: oldest)
         }
 
+        let clock = ContinuousClock()
+        let start = clock.now
         let compiledURL = modelDirectory.appending(
             path: "text/EmbeddingGemma2Text.mlmodelc",
             directoryHint: .isDirectory,
@@ -408,9 +428,18 @@ public actor CoreMLEmbeddingModel: EmbeddingModel {
         config.functionName = "embed_\(bucket)"
 
         let loaded = SendableMLModel(model: try MLModel(contentsOf: compiledURL, configuration: config))
+        IssaLog.info("ask embedding bucket loaded", [
+            "bucket": String(bucket),
+            "ms": String(Self.milliseconds(since: start, on: clock)),
+        ])
         loadedBuckets[bucket] = loaded
         bucketUseOrder.append(bucket)
         return loaded
+    }
+
+    private static func milliseconds(since start: ContinuousClock.Instant, on clock: ContinuousClock) -> Int {
+        let elapsed = start.duration(to: clock.now)
+        return Int(elapsed.components.seconds * 1_000 + elapsed.components.attoseconds / 1_000_000_000_000_000)
     }
 
     private nonisolated static func runSingle(

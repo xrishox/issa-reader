@@ -538,13 +538,44 @@ final class AskCoordinator {
             do {
                 _ = try await preparer.prepareIndex(source: source)
                 guard !Task.isCancelled else { return }
-                _ = try await store.ensureEmbeddings(
+                let clock = ContinuousClock()
+                let start = clock.now
+                let written = try await store.ensureEmbeddings(
                     in: uuid,
                     embedder: embedder,
                     upToSpine: upToSpine,
                     batchSize: SemanticRetriever.Limits.indexingBatchSize,
                     shouldContinue: { Self.canRunBackgroundEmbeddings() },
                 )
+                if written > 0 {
+                    let elapsed = start.duration(to: clock.now)
+                    let seconds = Double(elapsed.components.seconds)
+                        + Double(elapsed.components.attoseconds) / 1e18
+                    let ms = Int((seconds * 1_000).rounded())
+                    let msPerSpan = Int(((seconds * 1_000) / Double(written)).rounded())
+                    let spansPerSec = seconds > 0 ? String(format: "%.1f", Double(written) / seconds) : "0"
+                    let readProgress = try? await store.embeddingProgress(
+                        in: uuid, modelID: embedder.modelID, upToSpine: upToSpine,
+                    )
+                    let bookProgress = try? await store.embeddingProgress(
+                        in: uuid, modelID: embedder.modelID,
+                    )
+                    var fields: [String: String] = [
+                        "book": uuid,
+                        "written": String(written),
+                        "ms": String(ms),
+                        "msPerSpan": String(msPerSpan),
+                        "spansPerSec": spansPerSec,
+                    ]
+                    if let readProgress {
+                        fields["embedded"] = String(readProgress.embedded)
+                        fields["upToTotal"] = String(readProgress.total)
+                    }
+                    if let bookProgress {
+                        fields["bookTotal"] = String(bookProgress.total)
+                    }
+                    IssaLog.info("ask background embeddings finished", fields)
+                }
             } catch is CancellationError {
                 // Expected on chapter turn, backgrounding, or live ask.
             } catch {

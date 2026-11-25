@@ -1,4 +1,5 @@
 import Foundation
+import IssaCore
 
 /// Semantic retrieval over grouped ~175–250 word spans, blended with FTS5 BM25
 /// via Reciprocal Rank Fusion (`k = 60`), bounded `±1` neighbour expansion, and
@@ -78,22 +79,35 @@ public struct SemanticRetriever: Sendable {
         let missing = max(0, progress.total - progress.embedded)
         guard progress.total > 0 else { return nil }
         guard missing <= Limits.inlineEmbeddingCap else {
+            IssaLog.info("ask semantic skipped", [
+                "book": bookUUID,
+                "embedded": String(progress.embedded),
+                "total": String(progress.total),
+                "missing": String(missing),
+            ])
             return nil
         }
+        let clock = ContinuousClock()
+        var catchUpMs = 0
         if missing > 0 {
+            let catchUpStart = clock.now
             _ = try await store.ensureEmbeddings(
                 in: bookUUID,
                 embedder: embedder,
                 upToSpine: boundary.spineIndex,
                 batchSize: Limits.indexingBatchSize,
             )
+            catchUpMs = Self.milliseconds(since: catchUpStart, on: clock)
         }
         try Task.checkCancellation()
 
+        let queryStart = clock.now
         guard let queryVector = try await embedder.embed([sanitisedQuestion], mode: .query).first,
               !queryVector.isEmpty
         else { return nil }
+        let queryMs = Self.milliseconds(since: queryStart, on: clock)
 
+        let scoreStart = clock.now
         // Read strictly bounded span vectors from SQLite, then run cosine + RRF
         // scoring here off the store actor's executor.
         let admittedSpans = try await store.embeddedSpans(
@@ -134,7 +148,22 @@ public struct SemanticRetriever: Sendable {
         )
         guard !selected.isEmpty else { return nil }
 
-        return try await store.reconstructSpans(selected, in: bookUUID, before: boundary)
+        let reconstructed = try await store.reconstructSpans(selected, in: bookUUID, before: boundary)
+        IssaLog.info("ask semantic retrieval", [
+            "book": bookUUID,
+            "candidates": String(admittedSpans.count),
+            "returned": String(reconstructed.count),
+            "catchUpSpans": String(missing),
+            "catchUpMs": String(catchUpMs),
+            "queryMs": String(queryMs),
+            "scoreMs": String(Self.milliseconds(since: scoreStart, on: clock)),
+        ])
+        return reconstructed
+    }
+
+    private static func milliseconds(since start: ContinuousClock.Instant, on clock: ContinuousClock) -> Int {
+        let elapsed = start.duration(to: clock.now)
+        return Int(elapsed.components.seconds * 1_000 + elapsed.components.attoseconds / 1_000_000_000_000_000)
     }
 
     /// Pure ranking & selection stage (tested directly without CoreML or SQLite).
