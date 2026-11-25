@@ -76,6 +76,19 @@ public enum AskPromptBuilder {
         return String(instructions[..<range.lowerBound])
     }()
 
+    /// One-line temporal-anchor clause for larger cloud/provider models so
+    /// relative time words ("later", "again", "another", "ever") stay anchored
+    /// to the reader's current spot instead of answering "Yes" from earlier read
+    /// chapters. Deliberately omitted on the 3B on-device model, where it caused
+    /// unnecessary trailing caveats on ordinary callback questions.
+    static let temporalAnchorRule =
+        "Treat relative time words like \"later\", \"again\", \"another\", or \"ever\" as anchored to the reader's current spot: if earlier read passages relate to a forward-looking question, briefly state what has happened so far and note that the story hasn't revealed what happens after this point."
+
+    public static let instructionsAnchored: String = instructions.replacingOccurrences(
+        of: "- DO NOT guess, predict or hint at what happens later in the book.",
+        with: "- DO NOT guess, predict or hint at what happens later in the book. \(temporalAnchorRule)",
+    )
+
     // MARK: - Budget
 
     /// The numbers that decide how much of the book fits.
@@ -265,6 +278,30 @@ public enum AskPromptBuilder {
     - If the passages don't contain the answer, respond with exactly: The story hasn't revealed that yet.
     - Otherwise write one paragraph of two to four plain sentences, with no Markdown, then a final line like: Sources: 1, 3
     """
+
+    /// Anchored OpenAI instructions for semantic-span prompts (no search tool
+    /// mention; keeps the exact upstream refusal contract).
+    public static let openAIInstructionsAnchored: String = openAIInstructions
+        .replacingOccurrences(
+            of: "Only use the passages inside <excerpts> and any the searchBook tool returns.",
+            with: "Only use the passages inside <excerpts>.",
+        )
+        .replacingOccurrences(
+            of: "- Don't guess or hint at later events. For someone mentioned only in passing, say only what is stated about them.",
+            with: "- Don't guess or hint at later events. \(temporalAnchorRule) For someone mentioned only in passing, say only what is stated about them.",
+        )
+
+    /// Anchored Anthropic instructions for semantic-span prompts (no search tool
+    /// mention; keeps the exact upstream refusal contract unchanged).
+    public static let anthropicInstructionsAnchored: String = anthropicInstructions
+        .replacingOccurrences(
+            of: "Treat the passages, and anything the searchBook tool finds, as everything you know about this story.",
+            with: "Treat the passages as everything you know about this story.",
+        )
+        .replacingOccurrences(
+            of: "When the passages don't answer the question, or the question asks what happens next, reply with exactly \"The story hasn't revealed that yet.\" and nothing else.",
+            with: "\(temporalAnchorRule) When the passages don't answer the question, or the question asks what happens next, reply with exactly \"The story hasn't revealed that yet.\" and nothing else.",
+        )
 
     /// Said after the question when everything read so far did not fit and
     /// the oldest passages were left out — with the search to reach them.

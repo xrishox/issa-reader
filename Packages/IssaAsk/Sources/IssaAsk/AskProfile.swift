@@ -56,8 +56,95 @@ public struct AskProfile: Sendable, Hashable, Codable {
     public var everythingReadCeiling: Int
     /// How the prompt is laid out (`AskPromptBuilder.PromptStyle`).
     public var promptStyle: AskPromptBuilder.PromptStyle
+    /// Optional on-device semantic-span retrieval layered onto this profile.
+    ///
+    /// Keeping semantic retrieval as an optional overlay on top of the upstream
+    /// profile (rather than a replacement profile) guarantees two invariants:
+    /// 1. Previously serialised `AskProfile` JSON decodes cleanly (`nil`).
+    /// 2. Whenever a book's embeddings are still catching up (`> 16` read spans
+    ///    remaining) or the embedder fails, `AskEngine` falls straight back to
+    ///    this profile's exact upstream behaviour (`everythingRead`, `searchBook`
+    ///    tool, `60/40` cloud limits, or `15/12` device limits) with zero
+    ///    degradation.
+    public struct SemanticOptions: Sendable, Hashable, Codable {
+        public var excerptLimit: Int?
+        public var passageCeiling: Int?
+        public var recencySpans: Int
+        public var useRRF: Bool
+        public var embeddingDim: Int?
+        /// Optional override instructions used *only* when semantic retrieval
+        /// succeeds (e.g., adding the temporal-anchor rule on cloud/provider
+        /// models while omitting it on the 3B on-device model).
+        public var instructions: String?
+        /// Whether to strip `searchBook` tools when semantic retrieval succeeds.
+        public var disablesSearchTool: Bool
+
+        public init(
+            excerptLimit: Int? = nil,
+            passageCeiling: Int? = nil,
+            recencySpans: Int = 3,
+            useRRF: Bool = true,
+            embeddingDim: Int? = nil,
+            instructions: String? = nil,
+            disablesSearchTool: Bool = true,
+        ) {
+            self.excerptLimit = excerptLimit
+            self.passageCeiling = passageCeiling
+            self.recencySpans = recencySpans
+            self.useRRF = useRRF
+            self.embeddingDim = embeddingDim
+            self.instructions = instructions
+            self.disablesSearchTool = disablesSearchTool
+        }
+
+        /// Measured across 8 novels (400 Qs) on Apple's 4K on-device model:
+        /// 8 ~210-word spans (~2,800 tokens), 3 current-chapter recency spans
+        /// (last 2 pinned ahead of secondary hits), clean `instructionsWithoutExample`.
+        public static let device = SemanticOptions(
+            excerptLimit: 8,
+            passageCeiling: 2_800,
+            recencySpans: 3,
+            useRRF: true,
+            embeddingDim: nil,
+            instructions: nil,
+            disablesSearchTool: true,
+        )
+
+        /// Measured for Apple's 32K Private Cloud Compute window.
+        public static let cloud = SemanticOptions(
+            excerptLimit: 40,
+            passageCeiling: 20_000,
+            recencySpans: 6,
+            useRRF: true,
+            embeddingDim: nil,
+            instructions: AskPromptBuilder.instructionsAnchored,
+            disablesSearchTool: true,
+        )
+
+        /// Measured across 4 long novels + HP1 (~19K tokens, full 768d + RRF).
+        public static func provider(kind: ProviderKind?) -> SemanticOptions {
+            let anchored: String
+            switch kind {
+            case .anthropic: anchored = AskPromptBuilder.anthropicInstructionsAnchored
+            case .openAI: anchored = AskPromptBuilder.openAIInstructionsAnchored
+            case nil: anchored = AskPromptBuilder.instructionsAnchored
+            }
+            return SemanticOptions(
+                excerptLimit: 50,
+                passageCeiling: 20_000,
+                recencySpans: 6,
+                useRRF: true,
+                embeddingDim: nil,
+                instructions: anchored,
+                disablesSearchTool: true,
+            )
+        }
+    }
+
     /// For `.sandwich`: the rules, said again after the question.
     public var reminder: String?
+    /// Optional semantic-span retrieval overlay (nil = upstream retrieval only).
+    public var semantic: SemanticOptions?
 
     public init(
         name: String,
@@ -73,9 +160,11 @@ public struct AskProfile: Sendable, Hashable, Codable {
         everythingReadCeiling: Int = 0,
         promptStyle: AskPromptBuilder.PromptStyle = .plain,
         reminder: String? = nil,
+        semantic: SemanticOptions? = nil,
     ) {
         self.promptStyle = promptStyle
         self.reminder = reminder
+        self.semantic = semantic
         self.name = name
         self.instructions = instructions
         self.usesSearchTool = usesSearchTool
@@ -87,6 +176,14 @@ public struct AskProfile: Sendable, Hashable, Codable {
         self.shape = shape
         self.scrubsBookIdentity = scrubsBookIdentity
         self.everythingReadCeiling = everythingReadCeiling
+    }
+
+    /// Returns a copy of this upstream profile with on-device semantic retrieval
+    /// layered on top; every upstream field stays intact for mid-book fallback.
+    public func withSemantic(_ options: SemanticOptions) -> AskProfile {
+        var copy = self
+        copy.semantic = options
+        return copy
     }
 
     /// 1.7.1's engine, unchanged.

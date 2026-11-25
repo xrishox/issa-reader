@@ -116,6 +116,21 @@ public struct AskRetriever: Sendable {
     // MARK: - Asking
 
     public func retrieve(question: String, limit: Int = Limits.excerpts) async throws -> Retrieval {
+        try await retrieveWithSemantic(
+            question: question, limit: limit, semanticRetriever: nil, semanticOptions: nil,
+        ).retrieval
+    }
+
+    /// Unified retrieval entry point for `AskEngine` that runs the exact same
+    /// unmet-word guard, chronological recap, and kinship fast path before
+    /// optionally serving semantic spans — leaving `Retrieval` source-compatible
+    /// for every existing caller.
+    public func retrieveWithSemantic(
+        question: String,
+        limit: Int = Limits.excerpts,
+        semanticRetriever: SemanticRetriever?,
+        semanticOptions: AskProfile.SemanticOptions?,
+    ) async throws -> (retrieval: Retrieval, usedSemantic: Bool) {
         // The book's own names, bounded by the position, so an invented one the
         // general-purpose tagger misses ("Cheshire", "Ryn") is still recognised
         // as a name — and a character not yet met is still not.
@@ -138,7 +153,7 @@ public struct AskRetriever: Sendable {
         )
         // Retrieval is skipped when the answer is already known to be "not
         // yet": it would only cost a query whose results are thrown away.
-        guard unmet.isEmpty else { return .notYet(unmet: unmet) }
+        guard unmet.isEmpty else { return (.notYet(unmet: unmet), false) }
 
         guard !terms.isRecap else {
             let recap = try await store.recapPassages(
@@ -151,8 +166,46 @@ public struct AskRetriever: Sendable {
             // none of. `.notYet(unmet: [])` is what every other branch returns
             // for "nothing retrieved", and "the story hasn't revealed that yet"
             // is literally true before the first indexed passage.
-            guard !recap.isEmpty else { return .notYet(unmet: []) }
-            return .evidence(Self.recapRanked(recap), kind: .recap)
+            guard !recap.isEmpty else { return (.notYet(unmet: []), false) }
+            return (.evidence(Self.recapRanked(recap), kind: .recap), false)
+        }
+
+        // Preserve the deterministic kinship fast path (verbatim `origin: .book`
+        // answers with exact sentence citations) even when semantic retrieval is
+        // enabled.
+        if allowsFastPath, case let .kinship(subject, relation, _, form) = terms.kind {
+            let kinshipFound = try await evidence(for: terms, limit: limit)
+            if let answer = KinshipExtractor.answer(
+                subject: subject, relation: relation, form: form, in: kinshipFound,
+                knownNames: Set(known.map { NameFinder.Name.key(for: $0) }),
+            ) {
+                IssaLog.info("ask answered from the book's own sentence")
+                return (.answered(answer, evidence: EvidenceFinder.ranked(kinshipFound)), false)
+            }
+        }
+
+        // Optional on-device semantic span retrieval (~210w spans + FTS5 RRF).
+        // Returns nil when > `inlineEmbeddingCap` read spans are still catching
+        // up, falling straight through to upstream keyword/full retrieval below.
+        if let semanticRetriever, let semanticOptions {
+            do {
+                let sanitised = QueryTerms.sanitise(question)
+                if let semantic = try await semanticRetriever.retrieveIfReady(
+                    sanitisedQuestion: sanitised,
+                    knownNames: known,
+                    bookNames: bookNames,
+                    options: semanticOptions,
+                    fallbackLimit: limit,
+                ), !semantic.isEmpty {
+                    return (.evidence(semantic, kind: terms.kind), true)
+                }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                IssaLog.info("ask semantic retrieval fell back", [
+                    "kind": String(describing: type(of: error)),
+                ])
+            }
         }
 
         var found = try await evidence(for: terms, limit: limit)
@@ -161,24 +214,19 @@ public struct AskRetriever: Sendable {
             // paragraph that mentions them than the sentinel.
             found = try await general(terms, subject: nil, limit: limit)
         }
-        guard !found.isEmpty else { return .notYet(unmet: []) }
+        guard !found.isEmpty else { return (.notYet(unmet: []), false) }
 
-        if allowsFastPath, case let .kinship(subject, relation, _, form) = terms.kind,
-           let answer = KinshipExtractor.answer(
-               subject: subject, relation: relation, form: form, in: found,
-               knownNames: Set(known.map { NameFinder.Name.key(for: $0) }),
-           ) {
-            IssaLog.info("ask answered from the book's own sentence")
-            return .answered(answer, evidence: EvidenceFinder.ranked(found))
-        }
         let ranked = EvidenceFinder.ranked(found)
-        guard recencyPassages > 0 else { return .evidence(ranked, kind: terms.kind) }
+        guard recencyPassages > 0 else { return (.evidence(ranked, kind: terms.kind), false) }
         let recent = try await store.recapPassages(
             in: bookUUID, before: boundary, limit: recencyPassages,
         )
-        return .evidence(
-            Self.withRecency(ranked, recent: Self.inReadersChapter(recent, boundary: boundary)),
-            kind: terms.kind,
+        return (
+            .evidence(
+                Self.withRecency(ranked, recent: Self.inReadersChapter(recent, boundary: boundary)),
+                kind: terms.kind,
+            ),
+            false,
         )
     }
 

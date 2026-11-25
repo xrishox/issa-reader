@@ -480,6 +480,9 @@ public struct ReaderView: View {
         // retain the model.
         .onAppear { model.setReaderVisible(true) }
         .onDisappear {
+            #if !os(tvOS)
+            ask.stopBackgroundEmbeddings(for: model.book.uuid)
+            #endif
             model.setReaderVisible(false)
             Task { await model.saveProgress() }
             // Released only if nothing is playing it, so a book that is merely
@@ -633,7 +636,23 @@ public struct ReaderView: View {
         // have just been to Settings to turn Apple Intelligence on, and this is
         // the screen they came back to.
         .onChange(of: scenePhase) { _, phase in
-            if phase == .active { askAvailability = ask.deviceAvailability() }
+            if phase == .active {
+                askAvailability = ask.deviceAvailability()
+                ask.readerDidBecomeActive(for: model)
+            }
+        }
+        // Keep on-device semantic embeddings caught up to the reader's current
+        // chapter (never past it) when opening a book, returning to a book
+        // retained by playback (`initial: true`), turning chapters, or finishing
+        // a search-model download while a book is already open.
+        .onChange(of: model.phase == .ready, initial: true) { _, isReady in
+            if isReady { ask.indexEmbeddingsInBackground(for: model) }
+        }
+        .onChange(of: model.chapterIndex) { _, _ in
+            ask.indexEmbeddingsInBackground(for: model)
+        }
+        .onChange(of: ask.embeddingModelState.isReady) { _, isReady in
+            if isReady { ask.indexEmbeddingsInBackground(for: model) }
         }
         #if os(macOS)
         // The Mac keeps a real toolbar: its window chrome never moved the page.

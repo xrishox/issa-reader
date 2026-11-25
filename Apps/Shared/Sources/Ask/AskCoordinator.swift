@@ -95,19 +95,39 @@ final class AskCoordinator {
     private var prepared: Set<String> = []
     private var preparing: [String: Task<Void, Never>] = [:]
 
-    /// The observer token, in a box `deinit` can reach.
-    ///
-    /// A nonisolated `deinit` cannot read a main-actor property, and dropping
-    /// the removal instead is how a released object leaves a live observer
-    /// behind. `PlaybackSettings` solves the same problem the same way.
+    /// Optional on-device CoreML embedding model (nil in unit tests that script
+    /// `model` without passing an explicit `embeddingModel`).
+    private let coreMLEmbedder: CoreMLEmbeddingModel?
+    private let injectedEmbedder: (any EmbeddingModel)?
+    /// Observable installation state of the optional on-device search model.
+    private(set) var embeddingModelState: EmbeddingModelState = .notInstalled
+    private var embeddingDownloadTask: Task<Void, Never>?
+    private var embeddingDownloadToken: UUID?
+    private var pendingModelRemoval: Task<Void, Never>?
+    /// Per-book background embedding tasks, paired with an identity token so a
+    /// cancelled pass can never clear the handle of a newer chapter's pass.
+    private var embeddingTasks: [String: (token: UUID, task: Task<Void, Never>)] = [:]
+    /// Last active book open in a reader, so indexing resumes automatically
+    /// once thermal pressure or Low Power Mode clears.
+    private var lastIndexedBook: (source: BookSource, upToSpine: Int)?
+    private var isAppActive = true
+
+    /// The observer token, in a box `deinit` can reach, keeping a weak reference
+    /// to the centre it registered on so injected test centres never leak.
     private final class ObserverBox: @unchecked Sendable {
+        weak var centre: NotificationCenter?
         var token: (any NSObjectProtocol)?
         deinit {
-            if let token { NotificationCenter.default.removeObserver(token) }
+            if let token { (centre ?? .default).removeObserver(token) }
         }
     }
 
     private let signOutObserver = ObserverBox()
+    private let thermalObserver = ObserverBox()
+    private let powerObserver = ObserverBox()
+    #if os(iOS)
+    private let memoryObserver = ObserverBox()
+    #endif
 
     init(
         store: AskIndexStore = AskIndexStore(),
@@ -120,6 +140,7 @@ final class AskCoordinator {
         providerModel: (@MainActor (ProviderKind, ProviderModel, String) -> any AnswerModel)? = nil,
         catalog: (@Sendable (ProviderKind, String) async throws -> [ProviderModel])? = nil,
         deviceAvailability: (@MainActor () -> AskAvailability)? = nil,
+        embeddingModel: (any EmbeddingModel)? = nil,
         // Injectable for the same reason `PlaybackSettings`'s is: this observer
         // registers with `object: nil`, so a sign-out posted by any suite in a
         // parallel test run purged the index of every coordinator alive
@@ -155,12 +176,34 @@ final class AskCoordinator {
         }
         self.catalog = catalog ?? { kind, key in try await ProviderCatalog.models(kind, key: key) }
         deviceAvailabilityProvider = deviceAvailability ?? { AskAvailability.current() }
+
+        if let embeddingModel {
+            self.injectedEmbedder = embeddingModel
+            self.coreMLEmbedder = embeddingModel as? CoreMLEmbeddingModel
+            if let coreML = self.coreMLEmbedder {
+                coreML.sweepIncompleteDownloads()
+                self.embeddingModelState = coreML.isInstalledOnDisk() ? .ready : .notInstalled
+            } else {
+                self.embeddingModelState = .ready
+            }
+        } else if model == nil {
+            let client = CoreMLEmbeddingModel()
+            client.sweepIncompleteDownloads()
+            self.coreMLEmbedder = client
+            self.injectedEmbedder = nil
+            self.embeddingModelState = client.isInstalledOnDisk() ? .ready : .notInstalled
+        } else {
+            self.coreMLEmbedder = nil
+            self.injectedEmbedder = nil
+            self.embeddingModelState = .notInstalled
+        }
         preparer = AskEngine(model: self.model, store: store, turnstile: turnstile)
 
         // The indexes are per book and the books are per account, so an account
         // leaving takes its indexes with it. Through the same notification
         // `PlaybackSettings` uses, because this object is not owned by
         // `AppModel` either and there is nothing to call it directly.
+        signOutObserver.centre = centre
         signOutObserver.token = centre.addObserver(
             forName: PlaybackSettings.signOutNotification, object: nil, queue: .main,
         ) { [weak self] notification in
@@ -168,6 +211,26 @@ final class AskCoordinator {
             let kept = PlaybackSettings.keptBookUUIDs(in: notification)
             MainActor.assumeIsolated { self?.purgeAll(keeping: kept) }
         }
+        thermalObserver.centre = centre
+        thermalObserver.token = centre.addObserver(
+            forName: ProcessInfo.thermalStateDidChangeNotification, object: nil, queue: .main,
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.handleEnvironmentChange() }
+        }
+        powerObserver.centre = centre
+        powerObserver.token = centre.addObserver(
+            forName: .NSProcessInfoPowerStateDidChange, object: nil, queue: .main,
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.handleEnvironmentChange() }
+        }
+        #if os(iOS)
+        memoryObserver.centre = centre
+        memoryObserver.token = centre.addObserver(
+            forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: .main,
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.handleMemoryWarning() }
+        }
+        #endif
     }
 
     func job(for bookUUID: String) -> AskJob? { jobs[bookUUID] }
@@ -277,6 +340,208 @@ final class AskCoordinator {
     /// wait on, as `suggestions(for:)` does.
     func warmUp(for bookUUID: String) -> Task<Void, Never>? { preparing[bookUUID] }
 
+    // MARK: - On-device search model
+
+    /// Active embedder when installed and ready; nil otherwise so upstream
+    /// profiles run untouched.
+    private var activeEmbedder: (any EmbeddingModel)? {
+        guard embeddingModelState.isReady else { return nil }
+        return injectedEmbedder ?? coreMLEmbedder
+    }
+
+    /// True when the device is in a good thermal and battery state for
+    /// background embedding passes.
+    nonisolated static func canRunBackgroundEmbeddings() -> Bool {
+        let info = ProcessInfo.processInfo
+        if info.isLowPowerModeEnabled { return false }
+        switch info.thermalState {
+        case .nominal, .fair: return true
+        case .serious, .critical: return false
+        @unknown default: return false
+        }
+    }
+
+    /// Downloads the optional on-device search model (~313 MB) from Hugging Face.
+    func downloadEmbeddingModel() {
+        guard let client = coreMLEmbedder else { return }
+        if case .downloading = embeddingModelState { return }
+
+        let token = UUID()
+        embeddingDownloadToken = token
+        embeddingDownloadTask?.cancel()
+        embeddingModelState = .downloading(progress: 0)
+
+        let removalToAwait = pendingModelRemoval
+        let reportProgress: @Sendable (Double) -> Void = { [weak self] fraction in
+            Task { @MainActor [weak self] in
+                guard let self, self.embeddingDownloadToken == token,
+                      case .downloading = self.embeddingModelState
+                else { return }
+                self.embeddingModelState = .downloading(progress: fraction)
+            }
+        }
+        embeddingDownloadTask = Task { [weak self] in
+            // Wait for any in-flight `removeModel()` to finish so removing and
+            // immediately re-downloading cannot delete files out from under `.ready`.
+            await removalToAwait?.value
+            guard !Task.isCancelled else { return }
+            if client.isInstalledOnDisk() {
+                guard self?.embeddingDownloadToken == token else { return }
+                self?.embeddingModelState = .ready
+                self?.embeddingDownloadTask = nil
+                self?.embeddingDownloadToken = nil
+                return
+            }
+            do {
+                try await client.downloadModel(progress: reportProgress)
+                guard !Task.isCancelled, self?.embeddingDownloadToken == token else { return }
+                self?.embeddingModelState = .ready
+                self?.embeddingDownloadTask = nil
+                self?.embeddingDownloadToken = nil
+                self?.resumeLastIndexedBookIfPossible()
+            } catch {
+                guard self?.embeddingDownloadToken == token else { return }
+                self?.embeddingDownloadTask = nil
+                self?.embeddingDownloadToken = nil
+                if Self.isCancellation(error) {
+                    self?.embeddingModelState = client.isInstalledOnDisk() ? .ready : .notInstalled
+                } else {
+                    IssaLog.info("ask embedding model download failed", [
+                        "kind": String(describing: type(of: error)),
+                    ])
+                    self?.embeddingModelState = .failed(Self.downloadErrorMessage(for: error))
+                }
+            }
+        }
+    }
+
+    func cancelEmbeddingModelDownload() {
+        embeddingDownloadToken = nil
+        embeddingDownloadTask?.cancel()
+        embeddingDownloadTask = nil
+        if let client = coreMLEmbedder {
+            embeddingModelState = client.isInstalledOnDisk() ? .ready : .notInstalled
+        }
+    }
+
+    func removeEmbeddingModel() {
+        cancelEmbeddingModelDownload()
+        cancelAllBackgroundEmbeddings()
+        embeddingModelState = .notInstalled
+        if let client = coreMLEmbedder {
+            let previous = pendingModelRemoval
+            pendingModelRemoval = Task {
+                await previous?.value
+                await client.removeModel()
+            }
+        }
+    }
+
+    /// Called by `ReaderView` when its scene becomes active, avoiding a firing-
+    /// order race against `IssaReaderApp.appDidBecomeActive()`.
+    func readerDidBecomeActive(for model: ReaderModel) {
+        isAppActive = true
+        indexEmbeddingsInBackground(for: model)
+    }
+
+    /// Quietly indexes semantic spans up to the reader's current chapter on
+    /// book open and chapter turns. Stops cleanly on background, thermal
+    /// pressure, Low Power Mode, live question start, or reader close.
+    func indexEmbeddingsInBackground(for model: ReaderModel) {
+        guard model.phase == .ready, let source = model.askSource() else { return }
+        indexEmbeddingsInBackground(source: source, upToSpine: model.chapterIndex)
+    }
+
+    func indexEmbeddingsInBackground(source: BookSource, upToSpine: Int) {
+        lastIndexedBook = (source: source, upToSpine: upToSpine)
+        guard isAppActive,
+              let embedder = activeEmbedder,
+              !hasWorkingJob,
+              Self.canRunBackgroundEmbeddings()
+        else { return }
+
+        let uuid = source.bookUUID
+        embeddingTasks[uuid]?.task.cancel()
+        let token = UUID()
+        let existingPrep = preparing[uuid]
+        let task = Task(priority: .utility) { [weak self, preparer, store] in
+            await existingPrep?.value
+            guard !Task.isCancelled else { return }
+            do {
+                _ = try await preparer.prepareIndex(source: source)
+                guard !Task.isCancelled else { return }
+                _ = try await store.ensureEmbeddings(
+                    in: uuid,
+                    embedder: embedder,
+                    upToSpine: upToSpine,
+                    batchSize: SemanticRetriever.Limits.indexingBatchSize,
+                    shouldContinue: { Self.canRunBackgroundEmbeddings() },
+                )
+            } catch is CancellationError {
+                // Expected on chapter turn, backgrounding, or live ask.
+            } catch {
+                IssaLog.info("ask background embedding paused", [
+                    "kind": String(describing: type(of: error)),
+                ])
+            }
+            await MainActor.run {
+                if self?.embeddingTasks[uuid]?.token == token {
+                    self?.embeddingTasks.removeValue(forKey: uuid)
+                }
+            }
+        }
+        embeddingTasks[uuid] = (token: token, task: task)
+    }
+
+    func stopBackgroundEmbeddings(for bookUUID: String) {
+        embeddingTasks.removeValue(forKey: bookUUID)?.task.cancel()
+        if lastIndexedBook?.source.bookUUID == bookUUID {
+            lastIndexedBook = nil
+        }
+    }
+
+    private func cancelAllBackgroundEmbeddings() {
+        for entry in embeddingTasks.values { entry.task.cancel() }
+        embeddingTasks.removeAll()
+    }
+
+    private func handleEnvironmentChange() {
+        if Self.canRunBackgroundEmbeddings() {
+            resumeLastIndexedBookIfPossible()
+        } else {
+            cancelAllBackgroundEmbeddings()
+        }
+    }
+
+    private func resumeLastIndexedBookIfPossible() {
+        guard isAppActive, let book = lastIndexedBook else { return }
+        indexEmbeddingsInBackground(source: book.source, upToSpine: book.upToSpine)
+    }
+
+    private func handleMemoryWarning() {
+        cancelAllBackgroundEmbeddings()
+        if let client = coreMLEmbedder {
+            Task { await client.unloadModels() }
+        }
+        Task { [store] in await store.clearAllSpanCaches() }
+    }
+
+    private static func isCancellation(_ error: any Error) -> Bool {
+        if error is CancellationError { return true }
+        if let urlError = error as? URLError, urlError.code == .cancelled { return true }
+        return false
+    }
+
+    static func downloadErrorMessage(for error: any Error) -> String {
+        if let modelError = error as? CoreMLEmbeddingModel.ModelError {
+            return modelError.userFacingMessage
+        }
+        if let urlError = error as? URLError, urlError.code == .notConnectedToInternet {
+            return "No internet connection. Try again when you're back online."
+        }
+        return "Couldn't download the search model. Check your connection and try again."
+    }
+
     /// The reader is looking at this book's answer again, so the banner that
     /// was standing in for it has done its job.
     ///
@@ -378,16 +643,25 @@ final class AskCoordinator {
         // `<uuid>.building.sqlite`.
         let preparation = preparing[uuid]
 
+        // Pause background embedding while a live question runs so the reader's
+        // query never waits behind a utility batch on the Neural Engine.
+        embeddingTasks.removeValue(forKey: uuid)?.task.cancel()
+
         // Per question, with the `searchBook` tool bound to this boundary: the
-        // same factory `RegressionRun` asks the real model through.
+        // same factory `RegressionRun` asks the real model through. When the
+        // on-device search model is ready, layer `.semantic` onto the upstream
+        // profiles so mid-book fallback stays 100% identical to upstream.
+        let embedder = activeEmbedder
+        let deviceProfile: AskProfile = embedder != nil ? AskProfile.device.withSemantic(.device) : .device
+        let cloudProfile: AskProfile = embedder != nil ? AskProfile.cloud.withSemantic(.cloud) : .cloud
         let deviceEngine = AskEngine.forQuestion(
             model: model, store: store, bookUUID: uuid, boundary: boundary, turnstile: turnstile,
-            profile: .device,
+            profile: deviceProfile, embedder: embedder,
         )
         var engine = cloud.map {
             AskEngine.forQuestion(
                 model: $0, store: store, bookUUID: uuid, boundary: boundary,
-                turnstile: cloudTurnstile, profile: .cloud,
+                turnstile: cloudTurnstile, profile: cloudProfile, embedder: embedder,
             )
         } ?? deviceEngine
         if answerer == .cloud {
@@ -405,10 +679,14 @@ final class AskCoordinator {
                 finished(job)
                 return job
             }
+            let baseProvider = AskProfile.provider(for: provider.entry, kind: kind)
+            let providerProfile: AskProfile = embedder != nil
+                ? baseProvider.withSemantic(.provider(kind: kind))
+                : baseProvider
             engine = AskEngine.forQuestion(
                 model: provider.model, store: store, bookUUID: uuid, boundary: boundary,
-                turnstile: providerTurnstile(for: kind), profile: .provider(for: provider.entry, kind: kind),
-                package: source.package,
+                turnstile: providerTurnstile(for: kind), profile: providerProfile,
+                package: source.package, embedder: embedder,
             )
             job.providerModelName = provider.entry.displayName
         }
@@ -596,6 +874,11 @@ final class AskCoordinator {
     /// logging "ask job finished quietly". Leaving the app mid-question is
     /// exactly who the notification is for; the flag is set here too.
     func appDidEnterBackground() {
+        isAppActive = false
+        cancelAllBackgroundEmbeddings()
+        if let client = coreMLEmbedder, !hasWorkingJob {
+            Task { await client.unloadModels() }
+        }
         #if os(iOS)
         guard hasWorkingJob else { return }
         // Before the assertion guard, so a second backgrounding while one is
@@ -624,7 +907,9 @@ final class AskCoordinator {
     }
 
     func appDidBecomeActive() {
+        isAppActive = true
         releaseAssertion()
+        resumeLastIndexedBookIfPossible()
     }
 
     #if os(iOS)
@@ -669,6 +954,7 @@ final class AskCoordinator {
     /// One book's index, when its download goes.
     func remove(bookUUID: String) {
         cancel(bookUUID: bookUUID)
+        stopBackgroundEmbeddings(for: bookUUID)
         prepared.remove(bookUUID)
         preparing.removeValue(forKey: bookUUID)?.cancel()
         Task { [store] in await store.remove(bookUUID: bookUUID) }
@@ -687,6 +973,11 @@ final class AskCoordinator {
         prepared = prepared.filter { kept.contains($0) }
         for (uuid, task) in preparing where !kept.contains(uuid) { task.cancel() }
         preparing = preparing.filter { kept.contains($0.key) }
+        for (uuid, entry) in embeddingTasks where !kept.contains(uuid) { entry.task.cancel() }
+        embeddingTasks = embeddingTasks.filter { kept.contains($0.key) }
+        if let book = lastIndexedBook, !kept.contains(book.source.bookUUID) {
+            lastIndexedBook = nil
+        }
         if let request = reopenRequest, !kept.contains(request) { reopenRequest = nil }
         // Only when nothing kept is still answering: the assertion is what lets
         // a question finish in the background.
