@@ -104,6 +104,9 @@ final class AskCoordinator {
     private let injectedEmbedder: (any EmbeddingModel)?
     /// Observable installation state of the optional on-device search model.
     private(set) var embeddingModelState: EmbeddingModelState = .notInstalled
+    /// Books currently running a background embedding pass (only populated when
+    /// unembedded read spans remain, so already-indexed books never flash a spinner).
+    private(set) var indexingBooks: Set<String> = []
     private var embeddingDownloadTask: Task<Void, Never>?
     private var embeddingDownloadToken: UUID?
     private var pendingModelRemoval: Task<Void, Never>?
@@ -520,6 +523,12 @@ final class AskCoordinator {
         indexEmbeddingsInBackground(source: source, upToSpine: model.chapterIndex)
     }
 
+    /// True while a background embedding pass is actively embedding unindexed
+    /// read spans for `bookUUID`.
+    func isIndexingEmbeddings(for bookUUID: String) -> Bool {
+        indexingBooks.contains(bookUUID)
+    }
+
     func indexEmbeddingsInBackground(source: BookSource, upToSpine: Int) {
         lastIndexedBook = (source: source, upToSpine: upToSpine)
         guard isAppActive,
@@ -538,6 +547,26 @@ final class AskCoordinator {
             do {
                 _ = try await preparer.prepareIndex(source: source)
                 guard !Task.isCancelled else { return }
+                let initial = try await store.embeddingProgress(
+                    in: uuid,
+                    modelID: embedder.modelID,
+                    upToSpine: upToSpine,
+                    ensureSpans: true,
+                )
+                guard initial.embedded < initial.total else {
+                    await MainActor.run {
+                        if self?.embeddingTasks[uuid]?.token == token {
+                            self?.indexingBooks.remove(uuid)
+                            self?.embeddingTasks.removeValue(forKey: uuid)
+                        }
+                    }
+                    return
+                }
+                await MainActor.run {
+                    if self?.embeddingTasks[uuid]?.token == token {
+                        self?.indexingBooks.insert(uuid)
+                    }
+                }
                 let clock = ContinuousClock()
                 let start = clock.now
                 let written = try await store.ensureEmbeddings(
@@ -585,6 +614,7 @@ final class AskCoordinator {
             }
             await MainActor.run {
                 if self?.embeddingTasks[uuid]?.token == token {
+                    self?.indexingBooks.remove(uuid)
                     self?.embeddingTasks.removeValue(forKey: uuid)
                 }
             }
@@ -594,6 +624,7 @@ final class AskCoordinator {
 
     func stopBackgroundEmbeddings(for bookUUID: String) {
         embeddingTasks.removeValue(forKey: bookUUID)?.task.cancel()
+        indexingBooks.remove(bookUUID)
         if lastIndexedBook?.source.bookUUID == bookUUID {
             lastIndexedBook = nil
         }
@@ -602,6 +633,7 @@ final class AskCoordinator {
     private func cancelAllBackgroundEmbeddings() {
         for entry in embeddingTasks.values { entry.task.cancel() }
         embeddingTasks.removeAll()
+        indexingBooks.removeAll()
     }
 
     private func handleEnvironmentChange() {
@@ -745,6 +777,7 @@ final class AskCoordinator {
         // Pause background embedding while a live question runs so the reader's
         // query never waits behind a utility batch on the Neural Engine.
         embeddingTasks.removeValue(forKey: uuid)?.task.cancel()
+        indexingBooks.remove(uuid)
 
         // Per question, with the `searchBook` tool bound to this boundary: the
         // same factory `RegressionRun` asks the real model through. When the

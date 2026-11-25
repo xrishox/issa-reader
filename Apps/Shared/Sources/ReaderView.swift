@@ -793,6 +793,12 @@ public struct ReaderView: View {
         }
 
         if showsAskPill {
+            if ask.isIndexingEmbeddings(for: model.book.uuid) {
+                ProgressView()
+                    .controlSize(.small)
+                    .help("Indexing book for search…")
+                    .accessibilityLabel("Indexing book for search")
+            }
             Button { showsAsk = true } label: {
                 Image(systemName: "sparkles")
                     .symbolEffect(
@@ -1021,6 +1027,13 @@ public struct ReaderView: View {
     private func readerActions(_ fit: TopBarFit) -> some View {
         let askJob = ask.job(for: model.book.uuid)
         if showsAskPill {
+            if ask.isIndexingEmbeddings(for: model.book.uuid) {
+                ProgressView()
+                    .controlSize(.mini)
+                    .tint(model.style.theme.textTertiary)
+                    .accessibilityLabel("Indexing book for search")
+                    .accessibilityIdentifier("reader.ask.indexing")
+            }
             // A bare glyph, so the bar's own font and ink reach it exactly as
             // they reach the ones beside it. A tinted capsule with a word in
             // it read as a different class of control — an advertisement in a
