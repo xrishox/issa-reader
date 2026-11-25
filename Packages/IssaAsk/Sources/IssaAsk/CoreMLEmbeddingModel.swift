@@ -136,10 +136,13 @@ public actor CoreMLEmbeddingModel: EmbeddingModel {
         /// Gemma multiplies input token embeddings by √(hidden_size) = √512 ≈ 22.627417.
         static let embedScale: Float = 22.627417
         static let maxSequenceLength = 512
-        static let supportedBuckets = [32, 48, 64, 128, 256, 512]
-        /// Keeping at most two compiled bucket handles warm keeps both a query
-        /// bucket (32/48/64) and a passage bucket (256/512) hot while bounding RAM.
-        static let maxLoadedBuckets = 2
+        /// Pin all spans and queries to a single `embed_512` CoreML function.
+        /// Measured on iPhone 16 Pro Max: each sequence-length function incurs
+        /// a 38–62 s cold ANE compile and ~1.75 s per LRU eviction reload when
+        /// spans alternate across buckets, whereas keeping one `embed_512`
+        /// handle resident compiles once, halves RAM, and eliminates thrashing.
+        static let supportedBuckets = [512]
+        static let maxLoadedBuckets = 1
         /// Extra headroom required beyond the raw download size so staging +
         /// atomic replace never run the device out of storage.
         static let freeSpaceHeadroomBytes: Int64 = 128 * 1_024 * 1_024

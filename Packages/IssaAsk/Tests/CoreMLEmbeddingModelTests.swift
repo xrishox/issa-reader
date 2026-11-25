@@ -70,15 +70,11 @@ struct CoreMLEmbeddingModelTests {
     }
 
     #if canImport(CoreML) && !os(tvOS)
-    @Test("selects the smallest sequence-length bucket that fits")
+    @Test("routes all sequence lengths to the single resident embed_512 bucket")
     func bucketSelection() {
-        #expect(CoreMLEmbeddingModel.bucket(forLength: 1) == 32)
-        #expect(CoreMLEmbeddingModel.bucket(forLength: 32) == 32)
-        #expect(CoreMLEmbeddingModel.bucket(forLength: 33) == 48)
-        #expect(CoreMLEmbeddingModel.bucket(forLength: 48) == 48)
-        #expect(CoreMLEmbeddingModel.bucket(forLength: 49) == 64)
-        #expect(CoreMLEmbeddingModel.bucket(forLength: 65) == 128)
-        #expect(CoreMLEmbeddingModel.bucket(forLength: 200) == 256)
+        #expect(CoreMLEmbeddingModel.bucket(forLength: 1) == 512)
+        #expect(CoreMLEmbeddingModel.bucket(forLength: 32) == 512)
+        #expect(CoreMLEmbeddingModel.bucket(forLength: 128) == 512)
         #expect(CoreMLEmbeddingModel.bucket(forLength: 400) == 512)
         #expect(CoreMLEmbeddingModel.bucket(forLength: 600) == 512)
     }
