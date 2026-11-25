@@ -92,6 +92,10 @@ public final class BookSearchTool: AskTool {
     /// Applied to the excerpts' text before the model sees it — the reader's own
     /// key strips the title, the author and chapter headings (`BookIdentityScrubber`).
     private let render: @Sendable (Passage) -> String
+    /// Optional on-device embedder so follow-up `searchBook` calls also benefit
+    /// from semantic + FTS5 RRF retrieval when the book's read spans are ready.
+    private let embedder: (any EmbeddingModel)?
+    private let semanticOptions: AskProfile.SemanticOptions?
 
     /// How many times the model called this tool during the last generation —
     /// for the accuracy study, which measures whether a model uses it at all.
@@ -102,6 +106,8 @@ public final class BookSearchTool: AskTool {
         render: @escaping @Sendable (Passage) -> String = { $0.displayText },
         callLimit: Int = 2, passageLimit: Int = BookSearchTool.defaultPassageLimit,
         tokenCap: Int = BookSearchTool.defaultTokenCap,
+        embedder: (any EmbeddingModel)? = nil,
+        semanticOptions: AskProfile.SemanticOptions? = nil,
     ) {
         self.store = store
         self.bookUUID = bookUUID
@@ -110,6 +116,8 @@ public final class BookSearchTool: AskTool {
         self.callLimit = callLimit
         self.passageLimit = passageLimit
         self.tokenCap = tokenCap
+        self.embedder = embedder
+        self.semanticOptions = semanticOptions
     }
 
     // MARK: - AskTool
@@ -147,7 +155,27 @@ public final class BookSearchTool: AskTool {
             store: store, bookUUID: bookUUID, boundary: boundary, allowsFastPath: false,
             recencyPassages: 0,
         )
-        let retrieval = try? await retriever.retrieve(question: query, limit: passageLimit)
+        let semanticRetriever = embedder.map {
+            SemanticRetriever(
+                store: store, bookUUID: bookUUID, boundary: boundary, embedder: $0,
+            )
+        }
+        let toolSemanticOptions = semanticOptions.map {
+            AskProfile.SemanticOptions(
+                excerptLimit: passageLimit,
+                passageCeiling: nil,
+                recencySpans: 0,
+                neighbourRadius: 0,
+                useRRF: $0.useRRF,
+                embeddingDim: $0.embeddingDim,
+            )
+        }
+        let retrieval = (try? await retriever.retrieveWithSemantic(
+            question: query,
+            limit: passageLimit,
+            semanticRetriever: semanticRetriever,
+            semanticOptions: toolSemanticOptions,
+        ))?.retrieval
         var ranked: [PassageRanker.Ranked] = []
         // The best two, not the first two. Retrieval hands these back in book
         // order, so a `prefix` here spent the model's search on whichever two

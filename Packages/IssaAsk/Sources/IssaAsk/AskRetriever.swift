@@ -156,8 +156,51 @@ public struct AskRetriever: Sendable {
         guard unmet.isEmpty else { return (.notYet(unmet: unmet), false) }
 
         guard !terms.isRecap else {
+            // When semantic retrieval is active, targeted recap questions that
+            // name a character or topic ("What has happened to X so far?",
+            // "Remind me what happened at the bridge") should run through
+            // semantic + FTS5 RRF retrieval (which already includes
+            // current-chapter recency spans) instead of bypassing the embedder
+            // and falling back to whole-book `everythingRead`.
+            let isTargetedRecap = !terms.names.isEmpty
+                || terms.terms.contains { !Self.genericRecapWords.contains($0.lowercased()) }
+            if isTargetedRecap, let semanticRetriever, let semanticOptions {
+                do {
+                    let sanitised = QueryTerms.sanitise(question)
+                    if let semantic = try await semanticRetriever.retrieveIfReady(
+                        sanitisedQuestion: sanitised,
+                        knownNames: known,
+                        bookNames: bookNames,
+                        options: semanticOptions,
+                        fallbackLimit: limit,
+                    ), !semantic.isEmpty {
+                        return (.evidence(semantic, kind: .recap), true)
+                    }
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    IssaLog.info("ask semantic recap fell back", [
+                        "kind": String(describing: type(of: error)),
+                    ])
+                }
+            }
+
+            // Generic recap ("What has happened so far?"): chronological
+            // trailing passages before the boundary. When semantic options are
+            // active on a provider profile, keep `usedSemantic = true` so
+            // `AskEngine` packs recent passages under `semantic.passageCeiling`
+            // instead of dumping the entire read book via `everythingRead`.
+            let recapLimit: Int
+            let keepBounded: Bool
+            if !isTargetedRecap, semanticRetriever != nil, let semanticOptions {
+                recapLimit = max(limit, semanticOptions.excerptLimit ?? limit)
+                keepBounded = true
+            } else {
+                recapLimit = limit
+                keepBounded = false
+            }
             let recap = try await store.recapPassages(
-                in: bookUUID, before: boundary, limit: limit,
+                in: bookUUID, before: boundary, limit: recapLimit,
             )
             // A reader who opens the sheet before reading a word. The recap is
             // the first chip on it, so this is one tap away — and without the
@@ -167,7 +210,7 @@ public struct AskRetriever: Sendable {
             // for "nothing retrieved", and "the story hasn't revealed that yet"
             // is literally true before the first indexed passage.
             guard !recap.isEmpty else { return (.notYet(unmet: []), false) }
-            return (.evidence(Self.recapRanked(recap), kind: .recap), false)
+            return (.evidence(Self.recapRanked(recap), kind: .recap), keepBounded)
         }
 
         // Preserve the deterministic kinship fast path (verbatim `origin: .book`
@@ -240,6 +283,15 @@ public struct AskRetriever: Sendable {
             false,
         )
     }
+
+    /// Boilerplate words that appear in generic recap phrasings ("What has
+    /// happened so far?", "Catch me up", "Summarize the story") and do not
+    /// indicate a targeted character or topic search.
+    private static let genericRecapWords: Set<String> = [
+        "happened", "happen", "happening", "recap", "summarise", "summarize",
+        "summary", "catch", "remind", "read", "reading", "story", "book",
+        "chapter", "give", "brief", "quick", "short", "events", "plot",
+    ]
 
     /// Blends upstream's earliest-introduction passages for `.identity` questions
     /// into semantic spans at top priority (`0`), skipping any passage whose

@@ -456,4 +456,102 @@ struct SemanticRetrieverTests {
         )
         #expect(badWritten == 0)
     }
+
+    @Test("targeted and generic recap questions never bypass semantic budget into everythingRead")
+    func recapQuestionsRespectSemanticBudget() async throws {
+        let (store, source, directory) = try await AskFixture.preparedStore()
+        defer { AskFixture.remove(directory) }
+
+        let embedder = ScriptedEmbeddingModel()
+        let lateSpine = source.package.spine.count - 1
+        let boundary = ReadingBoundary(spineIndex: lateSpine, charOffset: 500, pageNumber: 1)
+        _ = try await store.ensureEmbeddings(in: source.bookUUID, embedder: embedder, upToSpine: lateSpine)
+
+        let tightSemantic = AskProfile.SemanticOptions(
+            excerptLimit: 4,
+            passageCeiling: 1_200,
+            recencySpans: 2,
+            neighbourRadius: 0,
+            useRRF: true,
+        )
+        let providerProfile = AskProfile.provider(
+            kind: .openAI, shape: .everythingRead, ceiling: 128_000, usesSearchTool: true, reasoning: .moderate,
+        ).withSemantic(tightSemantic)
+
+        // 1. Targeted recap ("What has happened to Alice so far?") uses semantic retrieval
+        //    instead of bypassing into whole-book `everythingRead`.
+        let targetedModel = ScriptedAnswerModel(contextSize: 128_000)
+        let targetedEngine = AskEngine.forQuestion(
+            model: targetedModel,
+            store: store,
+            bookUUID: source.bookUUID,
+            boundary: boundary,
+            profile: providerProfile,
+            package: source.package,
+            embedder: embedder,
+        )
+        let queriesBeforeTargeted = await embedder.queries()
+        var gotTargeted = false
+        for try await event in targetedEngine.ask(
+            question: "What has happened to Alice so far?", source: source, boundary: boundary,
+        ) {
+            if case .answered = event { gotTargeted = true }
+        }
+        #expect(gotTargeted)
+        #expect(await embedder.queries() == queriesBeforeTargeted + 1)
+        let targetedPrompt = try #require(await targetedModel.received.first?.prompt)
+        // A tight 1,200-token ceiling must stay far below the full book prompt.
+        #expect(targetedPrompt.count < 12_000)
+
+        // 2. Pure generic recap ("What has happened so far?") stays bounded under
+        //    `semantic.passageCeiling` without dumping `everythingRead` or embedding a query.
+        let genericModel = ScriptedAnswerModel(contextSize: 128_000)
+        let genericEngine = AskEngine.forQuestion(
+            model: genericModel,
+            store: store,
+            bookUUID: source.bookUUID,
+            boundary: boundary,
+            profile: providerProfile,
+            package: source.package,
+            embedder: embedder,
+        )
+        let queriesBeforeGeneric = await embedder.queries()
+        var gotGeneric = false
+        for try await event in genericEngine.ask(
+            question: "What has happened so far?", source: source, boundary: boundary,
+        ) {
+            if case .answered = event { gotGeneric = true }
+        }
+        #expect(gotGeneric)
+        #expect(await embedder.queries() == queriesBeforeGeneric)
+        let genericPrompt = try #require(await genericModel.received.first?.prompt)
+        #expect(genericPrompt.count < 12_000)
+    }
+
+    @Test("BookSearchTool uses semantic retrieval when embeddings are ready and falls back to FTS5")
+    func bookSearchToolUsesSemanticWhenReady() async throws {
+        let (store, source, directory) = try await AskFixture.preparedStore()
+        defer { AskFixture.remove(directory) }
+
+        let boundary = try AskFixture.endOf(spine: AskFixture.Spine.chapterI)
+        let embedder = ScriptedEmbeddingModel()
+        _ = try await store.ensureEmbeddings(in: source.bookUUID, embedder: embedder, upToSpine: boundary.spineIndex)
+
+        let tool = BookSearchTool(
+            store: store,
+            bookUUID: source.bookUUID,
+            boundary: boundary,
+            callLimit: 4,
+            passageLimit: 4,
+            tokenCap: 1_500,
+            embedder: embedder,
+            semanticOptions: .provider,
+        )
+        await tool.beginGeneration(numberingFrom: 1)
+        let queriesBefore = await embedder.queries()
+        let result = await tool.call(query: "rabbit watch waistcoat")
+        #expect(!result.isEmpty)
+        #expect(result != BookSearchTool.noMatches)
+        #expect(await embedder.queries() == queriesBefore + 1)
+    }
 }

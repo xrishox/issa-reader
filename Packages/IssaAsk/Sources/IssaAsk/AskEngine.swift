@@ -138,10 +138,14 @@ public actor AskEngine {
                 tools = [BookSearchTool(
                     store: store, bookUUID: bookUUID, boundary: boundary, render: render,
                     callLimit: size.calls, passageLimit: size.passages, tokenCap: size.tokens,
+                    embedder: embedder, semanticOptions: profile.semantic,
                 )]
             } else {
                 #if canImport(FoundationModels) && !os(tvOS)
-                tools = [SearchBookTool(store: store, bookUUID: bookUUID, boundary: boundary, render: render)]
+                tools = [SearchBookTool(
+                    store: store, bookUUID: bookUUID, boundary: boundary, render: render,
+                    embedder: embedder, semanticOptions: profile.semantic,
+                )]
                 #endif
             }
         }

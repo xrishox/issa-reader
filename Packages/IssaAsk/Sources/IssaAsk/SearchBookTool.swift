@@ -37,8 +37,13 @@ public final class SearchBookTool: AskTool, Tool {
     public init(
         store: AskIndexStore, bookUUID: String, boundary: ReadingBoundary,
         render: @escaping @Sendable (Passage) -> String = { $0.displayText },
+        embedder: (any EmbeddingModel)? = nil,
+        semanticOptions: AskProfile.SemanticOptions? = nil,
     ) {
-        search = BookSearchTool(store: store, bookUUID: bookUUID, boundary: boundary, render: render)
+        search = BookSearchTool(
+            store: store, bookUUID: bookUUID, boundary: boundary, render: render,
+            embedder: embedder, semanticOptions: semanticOptions,
+        )
     }
 
     public func beginGeneration(numberingFrom firstOrdinal: Int) async {
