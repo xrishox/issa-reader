@@ -242,6 +242,34 @@ struct OpenAIOAuthTests {
 
     // MARK: - Test helpers
 
+    @Test("OpenAIWire omits max_output_tokens and prompt_cache_breakpoint on ChatGPT OAuth while keeping API-key wire unchanged")
+    func oAuthOmitsUnsupportedResponseFields() throws {
+        let model = ProviderModel(id: "gpt-6.2-sol", displayName: "GPT-6.2 Sol", contextSize: 1_050_000, supportsEffort: true)
+        let options = AskGenerationOptions(maximumResponseTokens: 8_000, reasoning: .moderate, cacheablePrefix: 12)
+
+        let oauthMsg = OpenAIWire.firstMessage(prompt: "Earlier chapters.\nCurrent chapter.", cacheablePrefix: 17, isOAuth: true)
+        #expect(oauthMsg["content"] is String)
+
+        let apiKeyMsg = OpenAIWire.firstMessage(prompt: "Earlier chapters.\nCurrent chapter.", cacheablePrefix: 17, isOAuth: false)
+        #expect(apiKeyMsg["content"] is [[String: Any]])
+
+        let oauthData = try OpenAIWire.body(
+            model: model, instructions: "Rules", input: [oauthMsg], tools: [],
+            options: options, sendsReasoning: true, isOAuth: true,
+        )
+        let oauthJSON = try #require(try JSONSerialization.jsonObject(with: oauthData) as? [String: Any])
+        #expect(oauthJSON["max_output_tokens"] == nil)
+        #expect(oauthJSON["store"] as? Bool == false)
+        #expect(oauthJSON["stream"] as? Bool == true)
+
+        let apiKeyData = try OpenAIWire.body(
+            model: model, instructions: "Rules", input: [apiKeyMsg], tools: [],
+            options: options, sendsReasoning: true, isOAuth: false,
+        )
+        let apiKeyJSON = try #require(try JSONSerialization.jsonObject(with: apiKeyData) as? [String: Any])
+        #expect(apiKeyJSON["max_output_tokens"] as? Int == OpenAIWire.maximumOutputTokens)
+    }
+
     private func queryMap(_ url: URL) -> [String: String] {
         let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
         return Dictionary(items.compactMap { item in item.value.map { (item.name, $0) } }, uniquingKeysWith: { a, _ in a })

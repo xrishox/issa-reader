@@ -28,7 +28,7 @@ enum OpenAIWire {
     static func body(
         model: ProviderModel, instructions: String, input: [[String: Any]],
         tools: [any AskTool], options: AskGenerationOptions, sendsReasoning: Bool,
-        searchesLeft: Bool = true,
+        searchesLeft: Bool = true, isOAuth: Bool = false,
     ) throws -> Data {
         // The rules in a developer message at the start of the input, where
         // they outrank the reader's text and are cached with the prefix —
@@ -39,8 +39,12 @@ enum OpenAIWire {
             "input": [["role": "developer", "content": instructions]] + input,
             "stream": true,
             "store": false,
-            "max_output_tokens": maximumOutputTokens,
         ]
+        // Sign in with ChatGPT (plan usage) explicitly rejects `max_output_tokens`
+        // (HTTP 400 `invalid_parameter`); keep it on API-key requests unchanged.
+        if !isOAuth {
+            body["max_output_tokens"] = maximumOutputTokens
+        }
         if sendsReasoning {
             body["reasoning"] = ["effort": effort(options.reasoning)]
             // With nothing stored, a search's follow-up can only send the
@@ -93,10 +97,14 @@ enum OpenAIWire {
     /// breakpoints, and by default sets one at the end of the last message,
     /// after the question, so without this no two questions ever share a
     /// cache entry and every one pays for the whole book again.
-    static func firstMessage(prompt: String, cacheablePrefix: Int?) -> [String: Any] {
-        let utf16 = prompt.utf16
-        if let cut = cacheablePrefix, cut > 0, cut < utf16.count,
-           let index = utf16.index(utf16.startIndex, offsetBy: cut, limitedBy: utf16.endIndex),
+    static func firstMessage(
+        prompt: String, cacheablePrefix: Int?, isOAuth: Bool = false,
+    ) -> [String: Any] {
+        // Explicit `prompt_cache_breakpoint` is an API-key feature rejected with
+        // HTTP 400 `invalid_parameter` on ChatGPT plan usage OAuth routes.
+        if !isOAuth,
+           let cut = cacheablePrefix, cut > 0, cut < prompt.utf16.count,
+           let index = prompt.utf16.index(prompt.utf16.startIndex, offsetBy: cut, limitedBy: prompt.utf16.endIndex),
            let split = index.samePosition(in: prompt) {
             return ["role": "user", "content": [
                 ["type": "input_text", "text": String(prompt[..<split]),
@@ -116,6 +124,7 @@ enum OpenAIWire {
         try await run(
             model: model,
             tokenProvider: { _ in key },
+            isOAuth: false,
             session: session,
             instructions: instructions,
             prompt: prompt,
@@ -129,12 +138,15 @@ enum OpenAIWire {
     static func run(
         model: ProviderModel,
         tokenProvider: @Sendable (_ forceRefresh: Bool) async throws -> String,
+        isOAuth: Bool = true,
         session: URLSession,
         instructions: String, prompt: String, tools: [any AskTool], options: AskGenerationOptions,
         emit: (String) -> Void,
         usage report: ([String: String]) -> Void = { _ in },
     ) async throws {
-        var input: [[String: Any]] = [firstMessage(prompt: prompt, cacheablePrefix: options.cacheablePrefix)]
+        var input: [[String: Any]] = [
+            firstMessage(prompt: prompt, cacheablePrefix: options.cacheablePrefix, isOAuth: isOAuth),
+        ]
         let callable = tools.filter { $0.parametersJSONSchema != nil }
         let callLimit = callable.map(\.callLimit).max() ?? 0
         var sendsReasoning = model.supportsEffort
@@ -153,6 +165,7 @@ enum OpenAIWire {
                 let body = try Self.body(
                     model: model, instructions: instructions, input: input, tools: callable,
                     options: options, sendsReasoning: sendsReasoning, searchesLeft: calls < callLimit,
+                    isOAuth: isOAuth,
                 )
                 let request = ProviderHTTP.request(.openAI, path: "responses", key: key, method: "POST", body: body)
                 try await ProviderStream.events(.openAI, request: request, session: session) { event in

@@ -20,6 +20,7 @@ public final class ProviderAnswerModel: AnswerModel {
     public let kind: ProviderKind
     public let model: ProviderModel
     private let tokenProvider: @Sendable (_ forceRefresh: Bool) async throws -> String
+    private let isOAuth: Bool
     private let session: URLSession
     /// Told each turn's token counts, for the provider study's cost record.
     /// Nil in the app, which only logs them.
@@ -32,6 +33,7 @@ public final class ProviderAnswerModel: AnswerModel {
         self.kind = kind
         self.model = model
         self.tokenProvider = { _ in key }
+        self.isOAuth = false
         self.session = session ?? ProviderHTTP.defaultSession
         self.onUsage = onUsage
     }
@@ -45,6 +47,7 @@ public final class ProviderAnswerModel: AnswerModel {
         self.kind = kind
         self.model = model
         self.tokenProvider = tokenProvider
+        self.isOAuth = true
         self.session = session ?? ProviderHTTP.defaultSession
         self.onUsage = onUsage
     }
@@ -62,6 +65,8 @@ public final class ProviderAnswerModel: AnswerModel {
     public var tokenScale: Double { kind == .anthropic ? 1.5 : 1.15 }
 
     public func exactTokenCount(instructions: String, prompt: String, tools: [any AskTool]) async -> Int? {
+        // Sign in with ChatGPT plan usage does not expose `/v1/responses/input_tokens`.
+        if kind == .openAI, isOAuth { return nil }
         let callable = tools.filter { $0.parametersJSONSchema != nil }
         do {
             let key = try await tokenProvider(false)
@@ -109,7 +114,7 @@ public final class ProviderAnswerModel: AnswerModel {
         tools: [any AskTool],
         options: AskGenerationOptions,
     ) -> AsyncThrowingStream<String, any Error> {
-        let kind = kind, model = model, tokenProvider = tokenProvider, session = session
+        let kind = kind, model = model, tokenProvider = tokenProvider, isOAuth = isOAuth, session = session
         let usage: @Sendable ([String: String]) -> Void = { [onUsage] counts in onUsage?(counts) }
         return AsyncThrowingStream { continuation in
             let task = Task {
@@ -125,7 +130,8 @@ public final class ProviderAnswerModel: AnswerModel {
                         )
                     case .openAI:
                         try await OpenAIWire.run(
-                            model: model, tokenProvider: tokenProvider, session: session, instructions: instructions,
+                            model: model, tokenProvider: tokenProvider, isOAuth: isOAuth,
+                            session: session, instructions: instructions,
                             prompt: prompt, tools: tools, options: options,
                             emit: { continuation.yield($0) }, usage: usage,
                         )
